@@ -1161,7 +1161,8 @@ function commitJson(oid: string, view: CommitView): Record<string, unknown> {
   return {
     sha: oid,
     commit: {
-      message: view.message,
+      // GitHub strips the commit object's trailing newline from the message.
+      message: view.message.replace(/\n+$/, ''),
       author: { name: author.name, email: author.email, date: author.date },
       committer: { name: committer.name, email: committer.email, date: committer.date },
       tree: { sha: view.tree },
@@ -2044,6 +2045,54 @@ function depthLimitedCommits(forge: Forge, repo: Repo, wants: readonly string[],
   return out;
 }
 
+/** The objects a shallow fetch sends for one commit: the commit itself plus its
+ *  tree closure (trees + blobs), never its parents. */
+function commitTreeObjects(repo: Repo, commitOid: string, out: Set<string>): void {
+  const obj = repo.objects.get(commitOid);
+  if (!obj || obj.type !== 'commit') return;
+  out.add(commitOid);
+  const stack = [parseCommit(obj.data).tree];
+  while (stack.length > 0) {
+    const treeOid = stack.pop() as string;
+    if (out.has(treeOid)) continue;
+    const treeObj = repo.objects.get(treeOid);
+    if (!treeObj || treeObj.type !== 'tree') continue;
+    out.add(treeOid);
+    for (const entry of parseTree(treeObj.data)) {
+      if (entry.mode === '40000') stack.push(entry.oid);
+      else if (repo.objects.has(entry.oid)) out.add(entry.oid);
+    }
+  }
+}
+
+/** The objects a client already holds: the closure of its haves, but never past a
+ *  shallow boundary commit (a shallow clone holds the boundary commit and its
+ *  tree, not its parents). With no shallow lines this is plain reachability. */
+function heldObjects(forge: Forge, repo: Repo, haves: readonly string[], shallow: readonly string[]): Set<string> {
+  const boundary = new Set(shallow.map((oid) => forge.peel(repo, oid)));
+  const seen = new Set<string>();
+  const stack = [...haves];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    seen.add(oid);
+    if (obj.type === 'commit') {
+      const commit = parseCommit(obj.data);
+      stack.push(commit.tree);
+      if (!boundary.has(oid)) {
+        for (const parent of commit.parents) stack.push(parent);
+      }
+    } else if (obj.type === 'tree') {
+      for (const entry of parseTree(obj.data)) stack.push(entry.oid);
+    } else if (obj.type === 'tag') {
+      stack.push(parseTag(obj.data).object);
+    }
+  }
+  return seen;
+}
+
 /** The object set a fetch sends: want closures minus have closures, depth-limited. */
 function planFetchObjects(forge: Forge, repo: Repo, plan: FetchPlan): { objects: GitObject[]; included: Set<string>; boundary: Set<string> } {
   const peeledWants = plan.wants.map((oid) => forge.peel(repo, oid));
@@ -2064,16 +2113,17 @@ function planFetchObjects(forge: Forge, repo: Repo, plan: FetchPlan): { objects:
       for (const parent of parseCommit(obj.data).parents) stack.push(parent);
     }
   }
-  const held = forge.reachable(repo, plan.haves);
+  const held = heldObjects(forge, repo, plan.haves, plan.oldShallow);
   const send = new Set<string>();
   for (const oid of includedCommits) {
     if (held.has(oid)) continue;
-    const reachableFromCommit = forge.reachable(repo, [oid]);
-    for (const reachableOid of reachableFromCommit) {
-      if (held.has(reachableOid)) continue;
-      send.add(reachableOid);
+    if (plan.deepen !== null) commitTreeObjects(repo, oid, send);
+    else {
+      const reachableFromCommit = forge.reachable(repo, [oid]);
+      for (const reachableOid of reachableFromCommit) send.add(reachableOid);
     }
   }
+  for (const heldOid of held) send.delete(heldOid);
   // Wanted tags themselves always travel with the fetch.
   for (const oid of plan.wants) {
     const obj = repo.objects.get(oid);
@@ -2119,15 +2169,16 @@ function handleLsRefsV2(forge: Forge, repo: Repo, args: readonly string[]): Buff
     }
   }
   for (const entry of advertisedRefs(forge, repo)) {
+    // v2 ls-refs has one line per ref: a peeled tag carries `peeled:<commit>`
+    // on its own line. The v0 `^{}` pseudo-ref is never a v2 line — a client
+    // that finds the plain line first reads peeled as missing.
+    if (entry.ref.endsWith('^{}')) continue;
     const ref = entry.ref;
     if (!matches(ref)) continue;
     let line = entry.line;
-    if (entry.ref.endsWith('^{}')) {
-      if (!peel) continue;
-      const tagRef = ref.slice(0, -3);
-      const tagOid = repo.refs.get(tagRef);
-      if (tagOid === undefined) continue;
-      line = `${tagOid} ${tagRef} peeled:${entry.oid}\n`;
+    if (peel) {
+      const obj = repo.objects.get(entry.oid);
+      if (obj && obj.type === 'tag') line = `${entry.oid} ${ref} peeled:${forge.peel(repo, entry.oid)}\n`;
     }
     lines.push(line);
   }
