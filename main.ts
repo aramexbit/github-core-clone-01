@@ -1,104 +1,65 @@
-// Entry point for the github-core-clone forge.
-//
-// The lifecycle is the one the make.fun environment expects:
-//   1. start the forge on an ephemeral port,
-//   2. tell the environment which port it is on,
-//   3. wait until the environment says the trial is done,
-//   4. exit cleanly.
-//
-// Nothing here knows about the trial's checks; all behaviour lives in app.ts.
+// github-core-clone-01 v3 — entrypoint: lifecycle driver only.
+// Binds the forge on an ephemeral loopback port, registers it with the
+// make.fun environment, then waits for /done before exiting cleanly.
 
-import { createForgeServer } from './app.ts';
+import { createForge } from "./app.ts";
 
-const ENV_URL = process.env.MAKEFUN_ENV_URL ?? '';
-const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-const REGISTER_ATTEMPTS = 60;
-const REGISTER_DELAY_MS = 500;
-const DONE_POLL_MS = 500;
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const envUrl = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
+const token = process.env.MAKEFUN_SHOP_TOKEN ?? "";
+if (!envUrl || !token) {
+  console.error("MAKEFUN_ENV_URL and MAKEFUN_SHOP_TOKEN must both be set");
+  process.exit(1);
 }
 
-function log(message: string): void {
-  // Keep stdout clean for the harness; diagnostics go to stderr.
-  process.stderr.write(`[github-core-clone] ${message}\n`);
+const server = createForge(token);
+await new Promise<void>((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => resolve());
+});
+const address = server.address();
+if (!address || typeof address === "string") {
+  console.error("server did not bind a TCP port");
+  process.exit(1);
 }
+const port = address.port;
 
-/** POST {port} to the environment's /register, retrying while it warms up. */
-async function register(port: number): Promise<boolean> {
-  const url = `${ENV_URL.replace(/\/+$/, '')}/register`;
-  for (let attempt = 1; attempt <= REGISTER_ATTEMPTS; attempt += 1) {
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
-      });
-      if (response.ok) {
-        log(`registered on port ${port}`);
-        return true;
-      }
-      log(`register attempt ${attempt}: HTTP ${response.status}`);
-    } catch (error) {
-      log(`register attempt ${attempt}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    await sleep(REGISTER_DELAY_MS);
-  }
-  return false;
-}
-
-/** Long-poll the environment's /done until it reports the trial finished. */
-async function waitForDone(): Promise<void> {
-  const url = `${ENV_URL.replace(/\/+$/, '')}/done`;
-  for (;;) {
-    try {
-      const response = await fetch(url);
-      if (response.ok) {
-        const body = (await response.json()) as { done?: boolean };
-        if (body.done === true) {
-          log('environment reports done');
-          return;
-        }
-      }
-    } catch (error) {
-      log(`done poll: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    await sleep(DONE_POLL_MS);
-  }
-}
-
-async function main(): Promise<number> {
-  if (ENV_URL === '') {
-    log('MAKEFUN_ENV_URL is not set; nothing to register with');
-    return 1;
-  }
-  const server = createForgeServer({ token: SHOP_TOKEN });
-  const port = await new Promise<number>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '0.0.0.0', () => {
-      const address = server.address();
-      if (address && typeof address === 'object') resolve(address.port);
-      else reject(new Error('server did not bind a port'));
+// Register with the environment (the environment dials the address this
+// request came from, so loopback is correct).
+let registered = false;
+for (let attempt = 0; attempt < 40 && !registered; attempt++) {
+  try {
+    const r = await fetch(`${envUrl}/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ port }),
     });
-  });
-  log(`forge listening on port ${port}`);
-  const registered = await register(port);
-  if (!registered) {
-    log('could not register with the environment');
-    server.close();
-    return 1;
+    if (r.ok) registered = true;
+  } catch {
+    // environment not ready yet; retry
   }
-  await waitForDone();
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return 0;
+  if (!registered) await sleep(500);
+}
+if (!registered) {
+  console.error("could not register with the environment");
+  server.close();
+  process.exit(1);
 }
 
-main()
-  .then((code) => {
-    process.exit(code);
-  })
-  .catch((error: unknown) => {
-    log(`fatal: ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(1);
-  });
+// Wait for the suite to finish.
+for (;;) {
+  try {
+    const r = await fetch(`${envUrl}/done`);
+    if (r.ok) {
+      const body = (await r.json()) as { done?: boolean };
+      if (body.done === true) break;
+    }
+  } catch {
+    // environment not reachable yet; keep polling
+  }
+  await sleep(250);
+}
+
+server.close();
+process.exit(0);

@@ -1,5 +1,9 @@
 # github-core-clone-01
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/aramexbit/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/aramexbit/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A GitHub-compatible forge in one Node 22 stdlib-only process (no dependencies, no git
 binary, no internet at grading): REST v3 (repos, branches, commits, contents, issues,
 comments, labels, pull requests, merges), git smart HTTP (upload-pack / receive-pack,
@@ -39,3 +43,7 @@ in-memory: one trial is one process, and the suite seeds every fixture through t
 - Commit JSON strips one trailing newline from the message, the way GitHub renders it.
 - Packs are written without deltas; the reader handles plain, ofs-delta and ref-delta
   entries, which is what pushes from real git clients carry.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=rrcbfccn&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
