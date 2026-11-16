@@ -22,7 +22,7 @@ export function sha1Hex(data: Buffer): string {
 
 export function hashObject(type: string, data: Buffer): string {
   const h = createHash("sha1");
-  h.update(Buffer.from(`${type} ${data.length}\0`, "utf8"));
+  h.update(`${type} ${data.length}\0`, "utf8");
   h.update(data);
   return h.digest("hex");
 }
@@ -52,6 +52,17 @@ export function pktLine(payload: string | Buffer): Buffer {
 }
 export const PKT_FLUSH = Buffer.from("0000", "ascii");
 export const PKT_DELIM = Buffer.from("0001", "ascii");
+
+/** One sideband pkt-line for a slice of the pack: a single preallocated
+ *  buffer (4-byte hex length + band byte + raw bytes), no intermediate
+ *  concats per 65 KB chunk. */
+function pktLineBanded(pack: Buffer, off: number, len: number): Buffer {
+  const pkt = Buffer.allocUnsafe(4 + 1 + len);
+  pkt.write((len + 5).toString(16).padStart(4, "0"), 0, 4, "ascii");
+  pkt[4] = 1;
+  pack.copy(pkt, 5, off, off + len);
+  return pkt;
+}
 
 export interface PktPacket {
   kind: "flush" | "delim" | "response-end" | "data";
@@ -163,17 +174,38 @@ export function parseCommit(data: Buffer): CommitParts {
   const parents: string[] = [];
   let author = "";
   let committer = "";
-  for (const line of data.subarray(0, headEnd).toString("utf8").split("\n")) {
-    if (!line) continue;
-    const sp = line.indexOf(" ");
-    const key = sp < 0 ? line : line.slice(0, sp);
-    const val = sp < 0 ? "" : line.slice(sp + 1);
+  // Parse the header straight from the buffer: no whole-head string, no split.
+  let off = 0;
+  while (off < headEnd) {
+    const nl = data.indexOf(10, off);
+    const lineEnd = nl < 0 || nl > headEnd ? headEnd : nl;
+    const sp = data.indexOf(32, off);
+    if (sp < 0 || sp >= lineEnd) {
+      off = lineEnd + 1;
+      continue;
+    }
+    const key = data.subarray(off, sp).toString("ascii");
+    const val = data.subarray(sp + 1, lineEnd).toString("utf8");
     if (key === "tree") tree = val;
     else if (key === "parent") parents.push(val);
     else if (key === "author") author = val;
     else if (key === "committer") committer = val;
+    off = lineEnd + 1;
   }
   return { tree, parents, author, committer, message };
+}
+
+/** Parsed commit headers, cached per repo: commits are immutable, and the
+ *  push workload's ancestry walk would otherwise re-parse every commit on
+ *  every push (O(N^2) parses over a 200-push chain). */
+export function commitParts(repo: Repo, oid: string): CommitParts | null {
+  const cached = repo.commitCache.get(oid);
+  if (cached) return cached;
+  const obj = repo.objects.get(oid);
+  if (!obj || obj.type !== "commit") return null;
+  const parts = parseCommit(obj.data);
+  repo.commitCache.set(oid, parts);
+  return parts;
 }
 
 export function buildCommit(fields: {
@@ -543,7 +575,9 @@ export interface Repo {
   comments: Map<number, Comment[]>;
   packCache: Map<string, Buffer>;
   lsRefsCache: Buffer | null;
-  issueJson: Map<number, string>;
+  advCache: Map<string, Buffer>;
+  issueJson: Map<number, Buffer>;
+  commitCache: Map<string, CommitParts>;
 }
 
 export interface ForgeState {
@@ -608,7 +642,9 @@ export function createRepoRecord(
     comments: new Map(),
     packCache: new Map(),
     lsRefsCache: null,
+    advCache: new Map(),
     issueJson: new Map(),
+    commitCache: new Map(),
   };
   state.repos.set(repoKey(VIEWER_LOGIN, name), repo);
   return repo;
@@ -668,12 +704,35 @@ export function createCommitRecord(
 export function invalidateRepoCache(repo: Repo): void {
   repo.packCache.clear();
   repo.lsRefsCache = null;
+  repo.advCache.clear();
+}
+
+/** Parsed tree entries, cached on the object itself: trees are immutable,
+ *  and fetch/clone walks would otherwise re-parse every tree per request. */
+export function treeEntriesOfObj(obj: GitObject): TreeEntry[] {
+  const cached = (obj as unknown as { _tree?: TreeEntry[] })._tree;
+  if (cached) return cached;
+  const entries = parseTree(obj.data);
+  (obj as unknown as { _tree?: TreeEntry[] })._tree = entries;
+  return entries;
+}
+
+/** One tree entry by name, via a per-tree Map built once (lookupPath walks
+ *  one segment at a time and must not scan the entry list per segment). */
+export function treeEntryByName(obj: GitObject, name: string): TreeEntry | undefined {
+  let byName = (obj as unknown as { _treeByName?: Map<string, TreeEntry> })._treeByName;
+  if (!byName) {
+    byName = new Map<string, TreeEntry>();
+    for (const e of treeEntriesOfObj(obj)) byName.set(e.name, e);
+    (obj as unknown as { _treeByName?: Map<string, TreeEntry> })._treeByName = byName;
+  }
+  return byName.get(name);
 }
 
 export function treeEntriesOf(repo: Repo, treeOid: string): TreeEntry[] {
   const obj = repo.objects.get(treeOid);
   if (!obj || obj.type !== "tree") return [];
-  return parseTree(obj.data);
+  return treeEntriesOfObj(obj);
 }
 
 /** Flatten a tree into path -> {mode, oid} (recursive). */
@@ -701,8 +760,9 @@ export function lookupPath(
 ): { mode: string; oid: string } | null {
   let cur = treeOid;
   for (let i = 0; i < segments.length; i++) {
-    const entries = treeEntriesOf(repo, cur);
-    const e = entries.find((x) => x.name === segments[i]);
+    const obj = repo.objects.get(cur);
+    if (!obj || obj.type !== "tree") return null;
+    const e = treeEntryByName(obj, segments[i]);
     if (!e) return null;
     if (i === segments.length - 1) return { mode: e.mode, oid: e.oid };
     if (e.mode !== "40000") return null;
@@ -788,9 +848,8 @@ export function commitChain(repo: Repo, tipOid: string, limit: number): { oid: s
   const seen = new Set<string>();
   while (cur && out.length < limit && !seen.has(cur)) {
     seen.add(cur);
-    const obj = repo.objects.get(cur);
-    if (!obj || obj.type !== "commit") break;
-    const parts = parseCommit(obj.data);
+    const parts = commitParts(repo, cur);
+    if (!parts) break;
     out.push({ oid: cur, commit: parts });
     cur = parts.parents[0];
   }
@@ -799,13 +858,29 @@ export function commitChain(repo: Repo, tipOid: string, limit: number): { oid: s
 
 export function isAncestor(repo: Repo, anc: string, desc: string): boolean {
   if (anc === desc) return true;
+  // Fast path: a linear first-parent chain (the push workload's shape).
+  // Walk first parents only — O(depth) cached lookups, no queue, no re-parse.
+  let cur: string | undefined = desc;
+  const seenFirst = new Set<string>();
+  while (cur && !seenFirst.has(cur)) {
+    seenFirst.add(cur);
+    const parts = commitParts(repo, cur);
+    if (!parts) break;
+    if (parts.parents.length === 0) break;
+    const first = parts.parents[0];
+    if (first === anc) return true;
+    cur = first;
+    if (seenFirst.size > 100000) break;
+  }
+  // General DAG: BFS with an index-pointer queue (queue.shift() is O(N) in V8).
   const queue: string[] = [desc];
   const seen = new Set<string>([desc]);
-  while (queue.length) {
-    const cur = queue.shift()!;
-    const obj = repo.objects.get(cur);
-    if (!obj || obj.type !== "commit") continue;
-    for (const p of parseCommit(obj.data).parents) {
+  let head = 0;
+  while (head < queue.length) {
+    const curOid = queue[head++]!;
+    const parts = commitParts(repo, curOid);
+    if (!parts) continue;
+    for (const p of parts.parents) {
       if (p === anc) return true;
       if (!seen.has(p)) {
         seen.add(p);
@@ -821,12 +896,13 @@ export function findMergeBase(repo: Repo, a: string, b: string): string | null {
   const ancestors = new Set<string>();
   const queueA: string[] = [a];
   const seenA = new Set<string>([a]);
-  while (queueA.length) {
-    const cur = queueA.shift()!;
+  let headA = 0;
+  while (headA < queueA.length) {
+    const cur = queueA[headA++]!;
     ancestors.add(cur);
-    const obj = repo.objects.get(cur);
-    if (!obj || obj.type !== "commit") continue;
-    for (const p of parseCommit(obj.data).parents) {
+    const parts = commitParts(repo, cur);
+    if (!parts) continue;
+    for (const p of parts.parents) {
       if (!seenA.has(p)) {
         seenA.add(p);
         queueA.push(p);
@@ -836,12 +912,13 @@ export function findMergeBase(repo: Repo, a: string, b: string): string | null {
   }
   const queueB: string[] = [b];
   const seenB = new Set<string>([b]);
-  while (queueB.length) {
-    const cur = queueB.shift()!;
+  let headB = 0;
+  while (headB < queueB.length) {
+    const cur = queueB[headB++]!;
     if (ancestors.has(cur)) return cur;
-    const obj = repo.objects.get(cur);
-    if (!obj || obj.type !== "commit") continue;
-    for (const p of parseCommit(obj.data).parents) {
+    const parts = commitParts(repo, cur);
+    if (!parts) continue;
+    for (const p of parts.parents) {
       if (!seenB.has(p)) {
         seenB.add(p);
         queueB.push(p);
@@ -952,7 +1029,7 @@ export function computeSendSet(
       addObject(t);
       const obj = repo.objects.get(t);
       if (!obj || obj.type !== "tree") continue;
-      for (const e of parseTree(obj.data)) {
+      for (const e of treeEntriesOfObj(obj)) {
         if (e.mode === "40000") stack.push(e.oid);
         else addObject(e.oid);
       }
@@ -988,7 +1065,8 @@ export function computeSendSet(
     if (depth !== null && d > depth) continue;
     if (depth === null && (haveSet.has(oid) || shallowSet.has(oid))) continue;
     toSendCommits.push(oid);
-    const parts = parseCommit(obj.data);
+    const parts = commitParts(repo, oid);
+    if (!parts) continue;
     for (const p of parts.parents) {
       stack.push({ oid: p, depth: d + 1 });
     }
@@ -997,7 +1075,8 @@ export function computeSendSet(
   const treeSeen = new Set<string>();
   for (const oid of toSendCommits) {
     addObject(oid);
-    const parts = parseCommit(repo.objects.get(oid)!.data);
+    const parts = commitParts(repo, oid);
+    if (!parts) continue;
     addTreeClosure(parts.tree, treeSeen);
   }
 
@@ -1011,7 +1090,8 @@ export function computeSendSet(
     held.add(peeled);
     const obj = repo.objects.get(peeled);
     if (!obj || obj.type !== "commit") return;
-    const parts = parseCommit(obj.data);
+    const parts = commitParts(repo, peeled);
+    if (!parts) return;
     const stack2: string[] = [parts.tree];
     while (stack2.length) {
       const t = stack2.pop()!;
@@ -1020,7 +1100,7 @@ export function computeSendSet(
       held.add(t);
       const tObj = repo.objects.get(t);
       if (!tObj || tObj.type !== "tree") continue;
-      for (const e of parseTree(tObj.data)) {
+      for (const e of treeEntriesOfObj(tObj)) {
         if (e.mode === "40000") stack2.push(e.oid);
         else held.add(e.oid);
       }
@@ -1038,7 +1118,8 @@ export function computeSendSet(
     for (const oid of toSendCommits) {
       const obj = repo.objects.get(oid);
       if (!obj || obj.type !== "commit") continue;
-      const parts = parseCommit(obj.data);
+      const parts = commitParts(repo, oid);
+      if (!parts) continue;
       const hasParent = parts.parents.length > 0;
       const allParentsSent = parts.parents.every((p) => sentSet.has(p));
       if (hasParent && !allParentsSent) shallowOut.push(oid);
@@ -1086,9 +1167,7 @@ export function buildFetchV2Response(
     // payload cap is 65516, so raw chunks are at most 65515.
     const CHUNK = 65515;
     for (let off = 0; off < pack.length; off += CHUNK) {
-      const chunk = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-      const banded = Buffer.concat([Buffer.from([1]), chunk]);
-      parts.push(pktLine(banded));
+      parts.push(pktLineBanded(pack, off, Math.min(CHUNK, pack.length - off)));
     }
   }
   parts.push(PKT_FLUSH);
@@ -1119,9 +1198,7 @@ export function buildFetchV0Response(
     // payload cap is 65516, so raw chunks are at most 65515.
     const CHUNK = 65515;
     for (let off = 0; off < pack.length; off += CHUNK) {
-      const chunk = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-      const banded = Buffer.concat([Buffer.from([1]), chunk]);
-      parts.push(pktLine(banded));
+      parts.push(pktLineBanded(pack, off, Math.min(CHUNK, pack.length - off)));
     }
   }
   parts.push(PKT_FLUSH);
@@ -1142,6 +1219,8 @@ const V2_ADVERTISEMENT: Buffer = Buffer.concat([
 ]);
 
 export function advertisementV0(repo: Repo, service: "git-upload-pack" | "git-receive-pack"): Buffer {
+  const cached = repo.advCache.get(service);
+  if (cached) return cached;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const caps =
     service === "git-upload-pack"
@@ -1161,7 +1240,9 @@ export function advertisementV0(repo: Repo, service: "git-upload-pack" | "git-re
     }
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const buf = Buffer.concat(parts);
+  repo.advCache.set(service, buf);
+  return buf;
 }
 
 export interface LsRefsOptions {
@@ -1428,12 +1509,15 @@ export function issueToJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
-export function issueJsonString(repo: Repo, issue: Issue): string {
+/** The issue's JSON response as bytes, cached: the read workload GETs one
+ *  issue 2,000 times, and the response must not be re-stringified or
+ *  re-copied per request (sendHttp takes a Buffer as-is). */
+export function issueJsonBuffer(repo: Repo, issue: Issue): Buffer {
   const cached = repo.issueJson.get(issue.number);
   if (cached) return cached;
-  const text = JSON.stringify(issueToJson(repo, issue));
-  repo.issueJson.set(issue.number, text);
-  return text;
+  const buf = Buffer.from(JSON.stringify(issueToJson(repo, issue)), "utf8");
+  repo.issueJson.set(issue.number, buf);
+  return buf;
 }
 
 export function invalidateIssueCache(repo: Repo, number: number): void {
@@ -1505,8 +1589,9 @@ export function pullMergeable(repo: Repo, pull: Pull): "MERGEABLE" | "CONFLICTIN
   if (!baseCommit || !headCommit || baseCommit.type !== "commit" || headCommit.type !== "commit") {
     return "UNKNOWN";
   }
-  const baseParts = parseCommit(baseCommit.data);
-  const headParts = parseCommit(headCommit.data);
+  const baseParts = commitParts(repo, baseSha);
+  const headParts = commitParts(repo, pull.headSha);
+  if (!baseParts || !headParts) return "UNKNOWN";
   const mergeBase = findMergeBase(repo, baseSha, pull.headSha);
   if (mergeBase === null) return "CONFLICTING";
   const baseTree = new Map<string, { mode: string; oid: string }>();
@@ -1514,7 +1599,8 @@ export function pullMergeable(repo: Repo, pull: Pull): "MERGEABLE" | "CONFLICTIN
   const mergeTree = new Map<string, { mode: string; oid: string }>();
   const baseObj = repo.objects.get(mergeBase);
   if (baseObj && baseObj.type === "commit") {
-    flattenTree(repo, parseCommit(baseObj.data).tree, "", mergeTree);
+    const mergeParts = commitParts(repo, mergeBase);
+    if (mergeParts) flattenTree(repo, mergeParts.tree, "", mergeTree);
   }
   flattenTree(repo, baseParts.tree, "", baseTree);
   flattenTree(repo, headParts.tree, "", headTree);
@@ -1981,7 +2067,7 @@ export function handleRest(state: ForgeState, req: HttpRequest): HttpResponse {
           if (!repo.labels.has(l)) return errorJson(422, `label ${l} does not exist`);
         }
         const issue = createIssueRecord(state, repo, title, typeof body.body === "string" ? body.body : "", labels);
-        return { status: 201, headers: { "content-type": "application/json" }, body: issueJsonString(repo, issue) };
+        return { status: 201, headers: { "content-type": "application/json" }, body: issueJsonBuffer(repo, issue) };
       }
       return errorJson(404, "not found");
     }
@@ -1991,7 +2077,7 @@ export function handleRest(state: ForgeState, req: HttpRequest): HttpResponse {
     if (!issue) return errorJson(404, "not found");
     if (sub.length === 2) {
       if (method === "GET") {
-        return { status: 200, headers: { "content-type": "application/json" }, body: issueJsonString(repo, issue) };
+        return { status: 200, headers: { "content-type": "application/json" }, body: issueJsonBuffer(repo, issue) };
       }
       if (method === "PATCH") {
         const parsed = parseJsonBody(req.body);
@@ -2004,7 +2090,7 @@ export function handleRest(state: ForgeState, req: HttpRequest): HttpResponse {
         }
         issue.updatedAt = isoNow();
         invalidateIssueCache(repo, num);
-        return { status: 200, headers: { "content-type": "application/json" }, body: issueJsonString(repo, issue) };
+        return { status: 200, headers: { "content-type": "application/json" }, body: issueJsonBuffer(repo, issue) };
       }
       return errorJson(404, "not found");
     }
@@ -3205,6 +3291,30 @@ function sendRaw(res: ServerResponse, state: ForgeState, status: number, content
   res.end(body);
 }
 
+/** Parse the bench's hot issue paths without splitting or decoding:
+ *  /api/v3/repos/<owner>/<repo>/issues or .../issues/<digits>.
+ *  Returns null for any other shape. */
+function fastIssueRoute(path: string): { owner: string; repoName: string; number: number | null } | null {
+  const PREFIX = "/api/v3/repos/";
+  if (!path.startsWith(PREFIX)) return null;
+  const rest = path.slice(PREFIX.length);
+  const s1 = rest.indexOf("/");
+  if (s1 <= 0) return null;
+  const owner = rest.slice(0, s1);
+  const s2 = rest.indexOf("/", s1 + 1);
+  if (s2 < 0) return null;
+  const repoName = rest.slice(s1 + 1, s2);
+  if (!repoName) return null;
+  const tail = rest.slice(s2 + 1);
+  if (tail === "issues") return { owner, repoName, number: null };
+  if (!tail.startsWith("issues/")) return null;
+  const numText = tail.slice("issues/".length);
+  if (!numText || !/^[0-9]+$/.test(numText)) return null;
+  const number = parseInt(numText, 10);
+  if (!Number.isSafeInteger(number)) return null;
+  return { owner, repoName, number };
+}
+
 export async function handleRequest(state: ForgeState, req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
     const rawUrl = req.url ?? "/";
@@ -3212,8 +3322,6 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
     const path = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
     const query = qIndex >= 0 ? rawUrl.slice(qIndex + 1) : "";
     const method = req.method ?? "GET";
-    const headers: Record<string, string | string[] | undefined> = {};
-    for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = v;
 
     // Health probe: no auth, always 200.
     if (path === "/healthz" && method === "GET") {
@@ -3221,8 +3329,10 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
       return;
     }
 
-    // Auth for everything else.
-    const auth = headers.authorization;
+    // Auth for everything else. Node already lowercases header names, so
+    // the hot fast path below reads req.headers directly; the copied headers
+    // object is only built for the generic router further down.
+    const auth = req.headers.authorization;
     const authOk = typeof auth === "string" && auth === state.authHeader;
     if (!authOk) {
       sendHttp(res, state, errorJson(401, "unauthorized"));
@@ -3230,6 +3340,54 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
     }
 
     const body = method === "GET" || method === "HEAD" ? Buffer.alloc(0) : await readBody(req);
+
+    // Fast path: GET / POST a single issue (the bench's hot shapes).
+    // Exact segment match, no query string, no percent-escapes — anything
+    // else falls through to the generic router below, which stays the
+    // behaviour for every other request.
+    if (query === "" && !path.includes("%") && (method === "GET" || method === "POST")) {
+      const fast = fastIssueRoute(path);
+      if (fast) {
+        const repo = getRepo(state, fast.owner, fast.repoName);
+        if (repo) {
+          if (method === "GET" && fast.number !== null) {
+            const issue = repo.issues.get(fast.number);
+            if (issue) {
+              sendRaw(res, state, 200, "application/json", issueJsonBuffer(repo, issue));
+              return;
+            }
+          } else if (method === "POST" && fast.number === null) {
+            const parsed = parseJsonBody(body);
+            if (parsed.ok) {
+              const pbody = (parsed.value ?? {}) as Record<string, unknown>;
+              const title = typeof pbody.title === "string" ? pbody.title : "";
+              if (title) {
+                const labels = Array.isArray(pbody.labels)
+                  ? (pbody.labels as unknown[]).map((l) => String(l))
+                  : [];
+                let labelsOk = true;
+                for (const l of labels) {
+                  if (!repo.labels.has(l)) {
+                    labelsOk = false;
+                    break;
+                  }
+                }
+                if (labelsOk) {
+                  const issue = createIssueRecord(state, repo, title, typeof pbody.body === "string" ? pbody.body : "", labels);
+                  sendRaw(res, state, 201, "application/json", issueJsonBuffer(repo, issue));
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Generic router: build the lowercased headers copy + HttpRequest here
+    // (only reached when the fast path above did not handle the request).
+    const headers: Record<string, string | string[] | undefined> = {};
+    for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = v;
     const httpReq: HttpRequest = { method, path, query, headers, body };
 
     // Git smart HTTP: /{owner}/{repo}.git/...
