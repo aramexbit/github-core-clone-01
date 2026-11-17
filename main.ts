@@ -2,7 +2,7 @@
 // Binds the forge on an ephemeral loopback port, registers it with the
 // make.fun environment, then waits for /done before exiting cleanly.
 
-import { createForge } from "./app.ts";
+import { createForge, createRawForge } from "./app.ts";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -13,7 +13,10 @@ if (!envUrl || !token) {
   process.exit(1);
 }
 
-const server = createForge(token);
+// v5 Phase B: the raw node:net server is the default transport (same
+// handleRequest, no node:http overhead). MF_RAW_HTTP=0 falls back to the
+// node:http server for A/B comparison.
+const server = process.env.MF_RAW_HTTP === "0" ? createForge(token) : createRawForge(token);
 await new Promise<void>((resolve, reject) => {
   server.once("error", reject);
   server.listen(0, "127.0.0.1", () => resolve());

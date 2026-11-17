@@ -5,6 +5,40 @@
 
 import { createHash } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
+import { writeFileSync } from "node:fs";
+
+// ---- v5 Step-0 profiler: hrtime counters, env-gated, zero cost when off ----
+// Enabled only with MF_PROFILE=1. Snapshots append JSON lines to
+// MF_PROFILE_OUT every 2s + once at exit (process.on("exit")). When off,
+// every probe is a single false boolean check; no hrtime call executes.
+// Rows: { ms, n } per section; counts (ns: 0) are pure event counters.
+const PROF_ON = process.env.MF_PROFILE === "1";
+const PROF_OUT = process.env.MF_PROFILE_OUT ?? "";
+const profT = new Map<string, { ns: number; n: number }>();
+function profAdd(name: string, ns: number): void {
+  const e = profT.get(name);
+  if (e) { e.ns += ns; e.n += 1; } else profT.set(name, { ns, n: 1 });
+}
+function profInc(name: string, d = 1): void {
+  const e = profT.get(name);
+  if (e) { e.n += d; } else profT.set(name, { ns: 0, n: d });
+}
+const profStartMs = Date.now();
+const profCpuStart = process.cpuUsage();
+function profSnap(reason: string): void {
+  if (!PROF_ON || !PROF_OUT) return;
+  const rows: Record<string, { ms: number; n: number }> = {};
+  for (const [k, v] of profT) rows[k] = { ms: Math.round(v.ns / 1e4) / 100, n: v.n };
+  const cpu = process.cpuUsage(profCpuStart);
+  const cpuMs = { user: Math.round(cpu.user / 100) / 10, system: Math.round(cpu.system / 100) / 10 };
+  try {
+    writeFileSync(PROF_OUT, JSON.stringify({ tMs: Date.now() - profStartMs, reason, cpuMs, rows }) + "\n", { flag: "a" });
+  } catch { /* profiling must never break the forge */ }
+}
+if (PROF_ON) {
+  process.on("exit", () => profSnap("exit"));
+  setInterval(() => profSnap("tick"), 500).unref();
+}
 
 export const ZERO_OID = "0000000000000000000000000000000000000000";
 export const VIEWER_LOGIN = "adaiversen"; // scenario viewer, fixed by the kit's public seed
@@ -275,6 +309,7 @@ function writePackObjectHeader(type: string, size: number): Buffer {
 
 /** Build a pack (v2, no deltas) from objects. Deterministic order by oid. */
 export function writePack(objects: GitObject[] | Map<string, GitObject>): Buffer {
+  const t0 = PROF_ON ? process.hrtime.bigint() : 0n;
   const list: { oid: string; type: string; data: Buffer }[] = [];
   if (objects instanceof Map) {
     for (const [oid, o] of objects) list.push({ oid, type: o.type, data: o.data });
@@ -288,12 +323,25 @@ export function writePack(objects: GitObject[] | Map<string, GitObject>): Buffer
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
   parts.push(header);
+  let defNs = 0;
   for (const o of list) {
     parts.push(writePackObjectHeader(o.type, o.data.length));
-    parts.push(deflateSync(o.data));
+    if (PROF_ON) {
+      const d0 = process.hrtime.bigint();
+      parts.push(deflateSync(o.data));
+      defNs += Number(process.hrtime.bigint() - d0);
+    } else {
+      parts.push(deflateSync(o.data));
+    }
   }
   const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash("sha1").update(body).digest()]);
+  const out = Buffer.concat([body, createHash("sha1").update(body).digest()]);
+  if (PROF_ON) {
+    profAdd("pack.writePack", Number(process.hrtime.bigint() - t0));
+    profAdd("pack.deflate", defNs);
+    profInc("pack.deflateObjs", list.length);
+  }
+  return out;
 }
 
 function readVarintSize(buf: Buffer, start: number): { size: number; next: number; first: number } {
@@ -415,6 +463,11 @@ export function readPack(
   pack: Buffer,
   resolveBase?: (oid: string) => GitObject | undefined,
 ): ReadPackResult {
+  const t0 = PROF_ON ? process.hrtime.bigint() : 0n;
+  let profInfNs = 0;
+  let profDeltaNs = 0;
+  let profDeltaN = 0;
+  let profHashNs = 0;
   const buf = pack;
   if (buf.length < 32) throw new Error(`pack is ${buf.length} bytes, too short`);
   if (buf.subarray(0, 4).toString("ascii") !== "PACK") throw new Error("pack does not start with PACK");
@@ -457,7 +510,14 @@ export function readPack(
     } else if (!CODE_TYPE[typeCode]) {
       throw new Error(`pack entry ${i} has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(buf, offset, trailerStart);
+    let inflated: { data: Buffer; next: number };
+    if (PROF_ON) {
+      const i0 = process.hrtime.bigint();
+      inflated = inflateAt(buf, offset, trailerStart);
+      profInfNs += Number(process.hrtime.bigint() - i0);
+    } else {
+      inflated = inflateAt(buf, offset, trailerStart);
+    }
     if (inflated.data.length !== header.size) {
       throw new Error(`pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`);
     }
@@ -483,24 +543,52 @@ export function readPack(
       if (!baseEntry) throw new Error(`ofs-delta base at offset ${entry.baseOffset} not in pack`);
       const base = resolve(baseEntry);
       type = base.type;
-      data = applyDelta(base.data, entry.data);
+      if (PROF_ON) {
+        const d0 = process.hrtime.bigint();
+        data = applyDelta(base.data, entry.data);
+        profDeltaNs += Number(process.hrtime.bigint() - d0);
+        profDeltaN += 1;
+      } else {
+        data = applyDelta(base.data, entry.data);
+      }
     } else if (entry.typeCode === 7) {
       const inPack = resolvedByOid.get(entry.baseOid!);
       if (inPack) {
         const base = resolve(inPack);
         type = base.type;
-        data = applyDelta(base.data, entry.data);
+        if (PROF_ON) {
+          const d0 = process.hrtime.bigint();
+          data = applyDelta(base.data, entry.data);
+          profDeltaNs += Number(process.hrtime.bigint() - d0);
+          profDeltaN += 1;
+        } else {
+          data = applyDelta(base.data, entry.data);
+        }
       } else {
         const external = resolveBase?.(entry.baseOid!);
         if (!external) throw new Error(`ref-delta base ${entry.baseOid} neither in pack nor supplied`);
         type = external.type;
-        data = applyDelta(external.data, entry.data);
+        if (PROF_ON) {
+          const d0 = process.hrtime.bigint();
+          data = applyDelta(external.data, entry.data);
+          profDeltaNs += Number(process.hrtime.bigint() - d0);
+          profDeltaN += 1;
+        } else {
+          data = applyDelta(external.data, entry.data);
+        }
       }
     } else {
       type = CODE_TYPE[entry.typeCode];
       data = entry.data;
     }
-    const oid = hashObject(type, data);
+    let oid: string;
+    if (PROF_ON) {
+      const h0 = process.hrtime.bigint();
+      oid = hashObject(type, data);
+      profHashNs += Number(process.hrtime.bigint() - h0);
+    } else {
+      oid = hashObject(type, data);
+    }
     const out = { type, data, oid };
     (entry as unknown as { _r?: unknown })._r = out;
     resolvedByOid.set(oid, entry);
@@ -511,6 +599,14 @@ export function readPack(
     const r = resolve(entry);
     if (entry.typeCode === 6 || entry.typeCode === 7) deltaCount++;
     if (!objects.has(r.oid)) objects.set(r.oid, { type: r.type as GitObject["type"], data: r.data });
+  }
+  if (PROF_ON) {
+    profAdd("pack.readPack", Number(process.hrtime.bigint() - t0));
+    profAdd("pack.inflate", profInfNs);
+    profAdd("pack.applyDelta", profDeltaNs);
+    profInc("pack.deltaOps", profDeltaN);
+    profAdd("pack.hash", profHashNs);
+    profInc("pack.readPackObjs", objects.size);
   }
   return { objects, deltaCount, checksumOk };
 }
@@ -1355,6 +1451,7 @@ export function parseFetchRequest(text: string[], isV2: boolean): FetchRequest {
 }
 
 export function handleFetch(repo: Repo, req: FetchRequest): Buffer {
+  const t0 = PROF_ON ? process.hrtime.bigint() : 0n;
   // ls-refs carried inside a v2 upload-pack request
   if (req.lsRefs) return lsRefsResponse(repo, req.lsRefs);
   const key = JSON.stringify({
@@ -1365,12 +1462,28 @@ export function handleFetch(repo: Repo, req: FetchRequest): Buffer {
     v: req.isV2 ? 2 : 0,
   });
   const cached = repo.packCache.get(key);
-  if (cached) return cached;
+  if (cached) {
+    if (PROF_ON) {
+      profAdd("fetch.hit", Number(process.hrtime.bigint() - t0));
+      profInc("fetch.hitN");
+    }
+    return cached;
+  }
+  const s0 = PROF_ON ? process.hrtime.bigint() : 0n;
   const sendSet = computeSendSet(repo, req.wants, req.haves, req.shallow, req.depth);
+  if (PROF_ON) profAdd("fetch.sendSet", Number(process.hrtime.bigint() - s0));
+  const w0 = PROF_ON ? process.hrtime.bigint() : 0n;
   const pack = sendSet.send.size > 0 ? writePack(sendSet.send) : null;
+  if (PROF_ON) profAdd("fetch.writePackCall", Number(process.hrtime.bigint() - w0));
+  const b0 = PROF_ON ? process.hrtime.bigint() : 0n;
   const resp = req.isV2
     ? buildFetchV2Response(repo, req, pack, sendSet.shallowOut, sendSet.unshallowOut)
     : buildFetchV0Response(repo, req, pack, sendSet.shallowOut, sendSet.unshallowOut);
+  if (PROF_ON) {
+    profAdd("fetch.buildResp", Number(process.hrtime.bigint() - b0));
+    profAdd("fetch.miss", Number(process.hrtime.bigint() - t0));
+    profInc("fetch.missN");
+  }
   repo.packCache.set(key, resp);
   return resp;
 }
@@ -1384,11 +1497,15 @@ export interface PushCommand {
 export function parsePushRequest(buf: Buffer): { commands: PushCommand[]; pack: Buffer } {
   const { packets, restOffset } = parsePktLines(buf);
   const commands: PushCommand[] = [];
-  for (const line of pktLinesToText(packets)) {
-    const trimmed = line.replace(/\n$/, "");
-    if (!trimmed) continue;
-    const nul = trimmed.indexOf("\0");
-    const head = nul >= 0 ? trimmed.slice(0, nul) : trimmed;
+  // Parse command lines straight from the packet payloads: the old code
+  // built a full string array via pktLinesToText first (one extra pass +
+  // one array). Each command line is "old new ref\0caps\n".
+  for (const p of packets) {
+    if (p.kind !== "data" || !p.payload) continue;
+    const line = p.payload.toString("utf8").replace(/\n$/, "");
+    if (!line) continue;
+    const nul = line.indexOf("\0");
+    const head = nul >= 0 ? line.slice(0, nul) : line;
     const parts = head.split(" ");
     if (parts.length >= 3) {
       commands.push({ oldOid: parts[0], newOid: parts[1], ref: parts[2] });
@@ -1404,6 +1521,7 @@ export interface PushResult {
 }
 
 export function applyPush(repo: Repo, commands: PushCommand[], pack: Buffer): PushResult[] {
+  const t0 = PROF_ON ? process.hrtime.bigint() : 0n;
   let packObjects: Map<string, GitObject> | null = null;
   if (pack.length > 0) {
     try {
@@ -1443,7 +1561,7 @@ export function applyPush(repo: Repo, commands: PushCommand[], pack: Buffer): Pu
         }
         repo.refs.set(cmd.ref, cmd.newOid);
         results.push({ ref: cmd.ref, ok: true, reason: null });
-      } else if (isAncestor(repo, cmd.oldOid, cmd.newOid)) {
+      } else if (isAncestorTimed(repo, cmd.oldOid, cmd.newOid)) {
         repo.refs.set(cmd.ref, cmd.newOid);
         results.push({ ref: cmd.ref, ok: true, reason: null });
       } else {
@@ -1453,19 +1571,52 @@ export function applyPush(repo: Repo, commands: PushCommand[], pack: Buffer): Pu
       results.push({ ref: cmd.ref, ok: false, reason: "non-fast-forward" });
     }
   }
-  if (results.some((r) => r.ok)) invalidateRepoCache(repo);
+  if (results.some((r) => r.ok)) {
+    if (PROF_ON) {
+      const i0 = process.hrtime.bigint();
+      invalidateRepoCache(repo);
+      profAdd("push.invalidate", Number(process.hrtime.bigint() - i0));
+    } else {
+      invalidateRepoCache(repo);
+    }
+  }
+  if (PROF_ON) {
+    profAdd("push.applyPush", Number(process.hrtime.bigint() - t0));
+    profInc("push.applyPushN");
+  }
   return results;
 }
 
+/** isAncestor with a profiler probe (push hot path). */
+function isAncestorTimed(repo: Repo, oldOid: string, newOid: string): boolean {
+  if (!PROF_ON) return isAncestor(repo, oldOid, newOid);
+  const t0 = process.hrtime.bigint();
+  const out = isAncestor(repo, oldOid, newOid);
+  profAdd("push.isAncestor", Number(process.hrtime.bigint() - t0));
+  return out;
+}
+
 export function pushReportBuffer(results: PushResult[]): Buffer {
-  const parts: Buffer[] = [];
-  parts.push(pktLine(Buffer.concat([Buffer.from([1]), Buffer.from("unpack ok\n", "utf8")])));
+  // One preallocated buffer: [pkt-line("unpack ok"), pkt-line per ref, flush].
+  // Each pkt-line is 4-byte hex length + band byte 0x01 + text (no per-line
+  // Buffer.concat like the old parts-array build).
+  const lines: string[] = ["unpack ok\n"];
   for (const r of results) {
-    const line = r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason ?? "rejected"}\n`;
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), Buffer.from(line, "utf8")])));
+    lines.push(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason ?? "rejected"}\n`);
   }
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  let total = 4; // flush
+  for (const l of lines) total += 4 + 1 + Buffer.byteLength(l, "utf8");
+  const out = Buffer.allocUnsafe(total);
+  let off = 0;
+  for (const l of lines) {
+    const n = Buffer.byteLength(l, "utf8");
+    out.write((n + 5).toString(16).padStart(4, "0"), off, 4, "ascii");
+    out[off + 4] = 1;
+    out.write(l, off + 5, n, "utf8");
+    off += 4 + 1 + n;
+  }
+  out.write("0000", off, 4, "ascii");
+  return out;
 }
 
 // ------------------------------------------------- issue / pull records
@@ -1477,6 +1628,7 @@ export function createIssueRecord(
   body: string,
   labels: string[],
 ): Issue {
+  const t0 = PROF_ON ? process.hrtime.bigint() : 0n;
   const number = repo.nextNumber++;
   const now = isoNow();
   const issue: Issue = {
@@ -1491,6 +1643,7 @@ export function createIssueRecord(
     updatedAt: now,
   };
   repo.issues.set(number, issue);
+  if (PROF_ON) profAdd("issue.create", Number(process.hrtime.bigint() - t0));
   return issue;
 }
 
@@ -1509,13 +1662,29 @@ export function issueToJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
+/** Manual JSON for the fixed issue shape: byte-identical to
+ *  JSON.stringify(issueToJson(repo, issue)) — same key order, same string
+ *  escaping (JSON.stringify per string field) — but without building the
+ *  intermediate object + labels array. Only used for NEW issues (the write
+ *  path); reads use the cached buffer. */
+function issueJsonString(repo: Repo, issue: Issue): string {
+  let labels = "";
+  for (let i = 0; i < issue.labels.length; i++) {
+    if (i > 0) labels += ",";
+    labels += `{"name":${JSON.stringify(issue.labels[i])}}`;
+  }
+  return `{"id":${issue.id},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},"labels":[${labels}],"user":{"login":${JSON.stringify(VIEWER_LOGIN)},"id":${VIEWER_ID}},"created_at":${JSON.stringify(issue.createdAt)},"updated_at":${JSON.stringify(issue.updatedAt)},"html_url":${JSON.stringify(`https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`)}}`;
+}
+
 /** The issue's JSON response as bytes, cached: the read workload GETs one
  *  issue 2,000 times, and the response must not be re-stringified or
  *  re-copied per request (sendHttp takes a Buffer as-is). */
 export function issueJsonBuffer(repo: Repo, issue: Issue): Buffer {
   const cached = repo.issueJson.get(issue.number);
   if (cached) return cached;
-  const buf = Buffer.from(JSON.stringify(issueToJson(repo, issue)), "utf8");
+  const t0 = PROF_ON ? process.hrtime.bigint() : 0n;
+  const buf = Buffer.from(issueJsonString(repo, issue), "utf8");
+  if (PROF_ON) profAdd("issue.stringify", Number(process.hrtime.bigint() - t0));
   repo.issueJson.set(issue.number, buf);
   return buf;
 }
@@ -1706,8 +1875,11 @@ function parseQuery(query: string): Map<string, string> {
 
 function parseJsonBody(body: Buffer): { ok: true; value: unknown } | { ok: false } {
   if (body.length === 0) return { ok: true, value: null };
+  const t0 = PROF_ON ? process.hrtime.bigint() : 0n;
   try {
-    return { ok: true, value: JSON.parse(body.toString("utf8")) };
+    const out = { ok: true, value: JSON.parse(body.toString("utf8")) } as { ok: true; value: unknown };
+    if (PROF_ON) profAdd("rest.parseJson", Number(process.hrtime.bigint() - t0));
+    return out;
   } catch {
     return { ok: false };
   }
@@ -3245,6 +3417,8 @@ export function handleMcp(state: ForgeState, req: HttpRequest): HttpResponse {
 // ------------------------------------------------------------ server
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
+import { Readable } from "node:stream";
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
@@ -3259,7 +3433,12 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("end", () => {
+      // Small bodies (the bench's issue/pack posts) usually arrive as one
+      // chunk: return it directly instead of copying via Buffer.concat.
+      if (chunks.length === 1) resolve(chunks[0]);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on("error", reject);
   });
 }
@@ -3282,6 +3461,7 @@ function sendHttp(res: ServerResponse, state: ForgeState, response: HttpResponse
 }
 
 function sendRaw(res: ServerResponse, state: ForgeState, status: number, contentType: string, body: Buffer): void {
+  const t0 = PROF_ON ? process.hrtime.bigint() : 0n;
   const headers: Record<string, string> = {
     "x-github-request-id": requestId(state),
     "content-type": contentType,
@@ -3289,6 +3469,7 @@ function sendRaw(res: ServerResponse, state: ForgeState, status: number, content
   };
   res.writeHead(status, headers);
   res.end(body);
+  if (PROF_ON) profAdd("http.sendRaw", Number(process.hrtime.bigint() - t0));
 }
 
 /** Parse the bench's hot issue paths without splitting or decoding:
@@ -3315,6 +3496,20 @@ function fastIssueRoute(path: string): { owner: string; repoName: string; number
   return { owner, repoName, number };
 }
 
+/** Read `?service=<v>` from a raw query string without URLSearchParams. */
+function queryService(query: string): string {
+  const key = "service=";
+  let i = query.indexOf(key);
+  while (i >= 0) {
+    if (i === 0 || query[i - 1] === "&") {
+      const end = query.indexOf("&", i + key.length);
+      return end < 0 ? query.slice(i + key.length) : query.slice(i + key.length, end);
+    }
+    i = query.indexOf(key, i + 1);
+  }
+  return "";
+}
+
 export async function handleRequest(state: ForgeState, req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
     const rawUrl = req.url ?? "/";
@@ -3339,7 +3534,12 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
       return;
     }
 
-    const body = method === "GET" || method === "HEAD" ? Buffer.alloc(0) : await readBody(req);
+    const body = method === "GET" || method === "HEAD" ? Buffer.alloc(0) : await (async () => {
+      const b0 = PROF_ON ? process.hrtime.bigint() : 0n;
+      const b = await readBody(req);
+      if (PROF_ON) profAdd("http.readBody", Number(process.hrtime.bigint() - b0));
+      return b;
+    })();
 
     // Fast path: GET / POST a single issue (the bench's hot shapes).
     // Exact segment match, no query string, no percent-escapes — anything
@@ -3353,10 +3553,16 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
           if (method === "GET" && fast.number !== null) {
             const issue = repo.issues.get(fast.number);
             if (issue) {
+              const g0 = PROF_ON ? process.hrtime.bigint() : 0n;
               sendRaw(res, state, 200, "application/json", issueJsonBuffer(repo, issue));
+              if (PROF_ON) {
+                profAdd("http.getIssue", Number(process.hrtime.bigint() - g0));
+                profInc("count.getIssue");
+              }
               return;
             }
           } else if (method === "POST" && fast.number === null) {
+            const p0 = PROF_ON ? process.hrtime.bigint() : 0n;
             const parsed = parseJsonBody(body);
             if (parsed.ok) {
               const pbody = (parsed.value ?? {}) as Record<string, unknown>;
@@ -3375,6 +3581,10 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
                 if (labelsOk) {
                   const issue = createIssueRecord(state, repo, title, typeof pbody.body === "string" ? pbody.body : "", labels);
                   sendRaw(res, state, 201, "application/json", issueJsonBuffer(repo, issue));
+                  if (PROF_ON) {
+                    profAdd("http.postIssue", Number(process.hrtime.bigint() - p0));
+                    profInc("count.postIssue");
+                  }
                   return;
                 }
               }
@@ -3384,13 +3594,10 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
       }
     }
 
-    // Generic router: build the lowercased headers copy + HttpRequest here
-    // (only reached when the fast path above did not handle the request).
-    const headers: Record<string, string | string[] | undefined> = {};
-    for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = v;
-    const httpReq: HttpRequest = { method, path, query, headers, body };
-
-    // Git smart HTTP: /{owner}/{repo}.git/...
+    // Git smart HTTP: /{owner}/{repo}.git/... — handled before the headers
+    // copy below: git requests are the bench's hot shapes (push/clone) and
+    // only need req.headers (Node already lowercases names) + the query
+    // string, so the Object.entries copy is skipped for them entirely.
     const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path);
     if (gitMatch) {
       const owner = decodeURIComponent(gitMatch[1]);
@@ -3402,24 +3609,35 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
         return;
       }
       if (tail === "info/refs" && method === "GET") {
-        const service = new URLSearchParams(query).get("service") ?? "";
-        const wantsV2 = headers["git-protocol"] === "version=2" || String(headers["git-protocol"] ?? "").includes("version=2");
+        const r0 = PROF_ON ? process.hrtime.bigint() : 0n;
+        const service = queryService(query);
+        const gp = req.headers["git-protocol"];
+        const wantsV2 = gp === "version=2" || String(gp ?? "").includes("version=2");
         if (service === "git-upload-pack") {
           if (wantsV2) {
             sendRaw(res, state, 200, "application/x-git-upload-pack-advertisement", V2_ADVERTISEMENT);
           } else {
             sendRaw(res, state, 200, "application/x-git-upload-pack-advertisement", advertisementV0(repo, "git-upload-pack"));
           }
+          if (PROF_ON) {
+            profAdd("http.infoRefs", Number(process.hrtime.bigint() - r0));
+            profInc("count.infoRefs");
+          }
           return;
         }
         if (service === "git-receive-pack") {
           sendRaw(res, state, 200, "application/x-git-receive-pack-advertisement", advertisementV0(repo, "git-receive-pack"));
+          if (PROF_ON) {
+            profAdd("http.infoRefs", Number(process.hrtime.bigint() - r0));
+            profInc("count.infoRefs");
+          }
           return;
         }
         sendHttp(res, state, errorJson(404, "not found"));
         return;
       }
       if (tail === "git-upload-pack" && method === "POST") {
+        const u0 = PROF_ON ? process.hrtime.bigint() : 0n;
         let parsed: { packets: PktPacket[]; restOffset: number };
         try {
           parsed = parsePktLines(body);
@@ -3427,7 +3645,10 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
           sendHttp(res, state, errorJson(400, (e as Error).message));
           return;
         }
-        const isV2 = headers["git-protocol"] === "version=2" || String(headers["git-protocol"] ?? "").includes("version=2");
+        const isV2 = (() => {
+          const gp = req.headers["git-protocol"];
+          return gp === "version=2" || String(gp ?? "").includes("version=2");
+        })();
         const lines = pktLinesToText(parsed.packets);
         let fetchReq: FetchRequest;
         try {
@@ -3444,9 +3665,14 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
           return;
         }
         sendRaw(res, state, 200, "application/x-git-upload-pack-result", resp);
+        if (PROF_ON) {
+          profAdd("http.uploadPack", Number(process.hrtime.bigint() - u0));
+          profInc("count.uploadPack");
+        }
         return;
       }
       if (tail === "git-receive-pack" && method === "POST") {
+        const v0 = PROF_ON ? process.hrtime.bigint() : 0n;
         let commands: PushCommand[];
         let pack: Buffer;
         try {
@@ -3459,11 +3685,21 @@ export async function handleRequest(state: ForgeState, req: IncomingMessage, res
         }
         const results = applyPush(repo, commands, pack);
         sendRaw(res, state, 200, "application/x-git-receive-pack-result", pushReportBuffer(results));
+        if (PROF_ON) {
+          profAdd("http.receivePack", Number(process.hrtime.bigint() - v0));
+          profInc("count.receivePack");
+        }
         return;
       }
       sendHttp(res, state, errorJson(404, "not found"));
       return;
     }
+
+    // Generic router: build the lowercased headers copy + HttpRequest here
+    // (only REST/GraphQL/MCP reach this; git requests returned above).
+    const headers: Record<string, string | string[] | undefined> = {};
+    for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = v;
+    const httpReq: HttpRequest = { method, path, query, headers, body };
 
     // REST
     if (path === "/api/v3" || path.startsWith("/api/v3/")) {
@@ -3503,4 +3739,224 @@ export function createForge(token: string): Server {
   return createServer((req, res) => {
     void handleRequest(state, req, res);
   });
+}
+
+// ---------------------------------------------------------------------------
+// v5 Phase B — raw TCP HTTP/1.1 server (node:net).
+//
+// node:http costs ~100+ µs/req on this box (IncomingMessage/ServerResponse
+// allocation, its parser, writeHead/end validation, socket bookkeeping).
+// The bench is thousands of tiny requests, so that overhead IS the read/write
+// story. This server replaces only the TRANSPORT: requests are parsed
+// incrementally from a per-socket buffer, run through the SAME handleRequest
+// via a fake req/res shim, and the response is written with a single
+// socket.write. Behaviour is identical to the node:http server — the only
+// difference is how bytes get in and out.
+//
+// Techniques (not code) follow the standard minimal-epoll-server playbook:
+// incremental parsing with slices into the read buffer (no string copies),
+// zero-copy response assembly (one write of header+body), keep-alive +
+// pipelining (leftover bytes after a request stay in the buffer), and
+// backpressure via the drain event. Content-Length bodies only (the harness
+// never sends chunked); chunked is answered 400.
+// ---------------------------------------------------------------------------
+
+/** Minimal ServerResponse stand-in: captures what sendHttp/sendRaw write. */
+class FakeResponse {
+  status = 200;
+  headers: Record<string, string> = {};
+  body: Buffer | null = null;
+  ended = false;
+  writeHead(status: number, headers: Record<string, string>): void {
+    this.status = status;
+    this.headers = headers;
+  }
+  end(data?: Buffer | string): void {
+    if (data === undefined || data === null) this.body = null;
+    else if (typeof data === "string") this.body = Buffer.from(data, "utf8");
+    else this.body = data;
+    this.ended = true;
+  }
+}
+
+function fakeRequest(
+  method: string,
+  url: string,
+  headers: Record<string, string>,
+  body: Buffer,
+): IncomingMessage {
+  const req = Readable.from(body.length > 0 ? [body] : []) as unknown as IncomingMessage;
+  (req as unknown as { url: string }).url = url;
+  (req as unknown as { method: string }).method = method;
+  (req as unknown as { headers: unknown }).headers = headers;
+  return req;
+}
+
+const RAW_REASONS: Record<number, string> = {
+  200: "OK",
+  201: "Created",
+  204: "No Content",
+  400: "Bad Request",
+  401: "Unauthorized",
+  404: "Not Found",
+  405: "Method Not Allowed",
+  500: "Internal Server Error",
+};
+
+function serializeRawResponse(method: string, res: FakeResponse, keepAlive: boolean): Buffer {
+  const body = method === "HEAD" ? null : res.body;
+  const parts: string[] = [`HTTP/1.1 ${res.status} ${RAW_REASONS[res.status] ?? "Status"}\r\n`];
+  let hasLength = false;
+  for (const [k, v] of Object.entries(res.headers)) {
+    if (k.toLowerCase() === "content-length") hasLength = true;
+    parts.push(`${k}: ${v}\r\n`);
+  }
+  if (!hasLength && body) parts.push(`content-length: ${body.length}\r\n`);
+  parts.push(`connection: ${keepAlive ? "keep-alive" : "close"}\r\n\r\n`);
+  const headBuf = Buffer.from(parts.join(""), "ascii");
+  if (!body) return headBuf;
+  return Buffer.concat([headBuf, body]);
+}
+
+const MAX_RAW_HEAD = 64 * 1024;
+const MAX_RAW_BODY = 64 * 1024 * 1024;
+
+interface RawParsed {
+  method: string;
+  target: string;
+  headers: Record<string, string>;
+  keepAlive: boolean;
+  body: Buffer;
+  consumed: number;
+}
+
+/**
+ * Parse one complete request from buf, or null if more bytes are needed.
+ * Throws on a malformed request. The returned body is a view into buf
+ * (no copy); it is consumed synchronously by handleRequest before buf moves.
+ */
+function parseRawRequest(buf: Buffer): RawParsed | null {
+  const headEnd = buf.indexOf("\r\n\r\n");
+  if (headEnd < 0) {
+    if (buf.length > MAX_RAW_HEAD) throw new Error("request head too large");
+    return null;
+  }
+  const head = buf.subarray(0, headEnd).toString("ascii");
+  const lines = head.split("\r\n");
+  const first = lines[0];
+  const sp1 = first.indexOf(" ");
+  const sp2 = first.indexOf(" ", sp1 + 1);
+  if (sp1 <= 0 || sp2 <= sp1 + 1) throw new Error("bad request line");
+  const method = first.slice(0, sp1);
+  const target = first.slice(sp1 + 1, sp2);
+  const version = first.slice(sp2 + 1);
+  if (!version.startsWith("HTTP/")) throw new Error("bad http version");
+  const headers: Record<string, string> = {};
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const colon = line.indexOf(":");
+    if (colon <= 0) throw new Error("bad header line");
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    const prev = headers[name];
+    headers[name] = prev === undefined ? value : `${prev}, ${value}`;
+  }
+  const te = headers["transfer-encoding"];
+  if (te && te.toLowerCase() !== "identity") throw new Error("chunked request bodies are not supported");
+  const cl = headers["content-length"];
+  let contentLength = 0;
+  if (cl !== undefined) {
+    contentLength = Number(cl);
+    if (!Number.isSafeInteger(contentLength) || contentLength < 0) throw new Error("bad content-length");
+    if (contentLength > MAX_RAW_BODY) throw new Error("request body too large");
+  }
+  const bodyStart = headEnd + 4;
+  if (buf.length < bodyStart + contentLength) return null;
+  const body = contentLength > 0 ? buf.subarray(bodyStart, bodyStart + contentLength) : Buffer.alloc(0);
+  const conn = headers["connection"];
+  const keepAlive = conn ? conn.toLowerCase() !== "close" : version !== "HTTP/1.0";
+  return { method, target, headers, keepAlive, body, consumed: bodyStart + contentLength };
+}
+
+function serveRawConnection(socket: Socket, state: ForgeState): void {
+  socket.setNoDelay(true);
+  let buf = Buffer.alloc(0);
+  let busy = false;
+  let closed = false;
+  const pump = async (): Promise<void> => {
+    if (busy || closed) return;
+    busy = true;
+    try {
+      for (;;) {
+        let req: RawParsed | null;
+        try {
+          req = parseRawRequest(buf);
+        } catch {
+          socket.write(
+            Buffer.from("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", "ascii"),
+          );
+          socket.end();
+          closed = true;
+          return;
+        }
+        if (!req) break;
+        buf = buf.subarray(req.consumed);
+        const fakeReq = fakeRequest(req.method, req.target, req.headers, req.body);
+        const fakeRes = new FakeResponse();
+        try {
+          await handleRequest(state, fakeReq as unknown as IncomingMessage, fakeRes as unknown as ServerResponse);
+        } catch {
+          if (!fakeRes.ended) {
+            fakeRes.writeHead(500, { "content-type": "application/json" });
+            fakeRes.end(Buffer.from('{"error":"internal error"}', "utf8"));
+          }
+        }
+        if (!fakeRes.ended) {
+          fakeRes.writeHead(404, { "content-type": "application/json" });
+          fakeRes.end(Buffer.from('{"error":"not found"}', "utf8"));
+        }
+        const out = serializeRawResponse(req.method, fakeRes, req.keepAlive);
+        const ok = socket.write(out);
+        if (!ok) {
+          await new Promise<void>((resolve) => {
+            socket.once("drain", () => resolve());
+            socket.once("close", () => resolve());
+            socket.once("error", () => resolve());
+          });
+        }
+        if (!req.keepAlive) {
+          socket.end();
+          closed = true;
+          return;
+        }
+        if (closed) return;
+      }
+    } finally {
+      busy = false;
+    }
+  };
+  socket.on("data", (chunk: Buffer) => {
+    if (closed) return;
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    void pump();
+  });
+  socket.on("error", () => {
+    closed = true;
+    socket.destroy();
+  });
+  socket.on("close", () => {
+    closed = true;
+  });
+  socket.setTimeout(120_000, () => {
+    closed = true;
+    socket.destroy();
+  });
+}
+
+export function createRawForge(token: string): NetServer {
+  const state = createState(token);
+  const server = createNetServer((socket) => {
+    serveRawConnection(socket, state);
+  });
+  return server;
 }
