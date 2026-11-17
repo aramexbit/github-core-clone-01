@@ -1,8 +1,12 @@
-// github-core-clone-01 v3 — entrypoint: lifecycle driver only.
-// Binds the forge on an ephemeral loopback port, registers it with the
-// make.fun environment, then waits for /done before exiting cleanly.
+// github-core-clone-01 v6 — entrypoint: lifecycle driver only.
+// Spawns the vendored Go forge binary (forge/forge, statically linked,
+// built from forge/*.go), reads the ephemeral loopback port it prints on
+// stdout ("PORT <n>"), registers the port with the make.fun environment,
+// then waits for /done before exiting cleanly.
 
-import { createForge, createRawForge } from "./app.ts";
+import { spawn, type ChildProcess } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -13,20 +17,43 @@ if (!envUrl || !token) {
   process.exit(1);
 }
 
-// v5 Phase B: the raw node:net server is the default transport (same
-// handleRequest, no node:http overhead). MF_RAW_HTTP=0 falls back to the
-// node:http server for A/B comparison.
-const server = process.env.MF_RAW_HTTP === "0" ? createForge(token) : createRawForge(token);
-await new Promise<void>((resolve, reject) => {
-  server.once("error", reject);
-  server.listen(0, "127.0.0.1", () => resolve());
+const repoDir = dirname(fileURLToPath(import.meta.url));
+const binaryPath = join(repoDir, "forge", "forge");
+
+const child: ChildProcess = spawn(binaryPath, [], {
+  env: { ...process.env, MAKEFUN_SHOP_TOKEN: token },
+  stdio: ["ignore", "pipe", "inherit"],
 });
-const address = server.address();
-if (!address || typeof address === "string") {
-  console.error("server did not bind a TCP port");
+
+let port = 0;
+const portPromise = new Promise<number>((resolve, reject) => {
+  let buf = "";
+  const timer = setTimeout(() => reject(new Error("forge binary did not print its port in time")), 30000);
+  child.stdout!.on("data", (chunk: Buffer) => {
+    buf += chunk.toString("utf8");
+    const m = /^PORT (\d+)\n/m.exec(buf);
+    if (m) {
+      clearTimeout(timer);
+      resolve(parseInt(m[1], 10));
+    }
+  });
+  child.once("exit", (code) => {
+    clearTimeout(timer);
+    reject(new Error(`forge binary exited early with code ${code}`));
+  });
+  child.once("error", (err) => {
+    clearTimeout(timer);
+    reject(err);
+  });
+});
+
+try {
+  port = await portPromise;
+} catch (e) {
+  console.error(`could not start forge binary: ${(e as Error).message}`);
+  try { child.kill("SIGKILL"); } catch { /* already gone */ }
   process.exit(1);
 }
-const port = address.port;
 
 // Register with the environment (the environment dials the address this
 // request came from, so loopback is correct).
@@ -46,7 +73,7 @@ for (let attempt = 0; attempt < 40 && !registered; attempt++) {
 }
 if (!registered) {
   console.error("could not register with the environment");
-  server.close();
+  child.kill("SIGTERM");
   process.exit(1);
 }
 
@@ -64,5 +91,5 @@ for (;;) {
   await sleep(250);
 }
 
-server.close();
+child.kill("SIGTERM");
 process.exit(0);
