@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type issue struct {
@@ -85,7 +86,7 @@ type forgeState struct {
 	repos         map[string]*repo
 	nextRepoID    int
 	nextCommentID int
-	requestSeq    int
+	requestSeq    atomic.Uint64 // lock-free request-id counter (hot path)
 	globalSeq     int
 	seqMu         sync.Mutex // guards globalSeq only (never held with repo locks)
 }
@@ -108,10 +109,7 @@ func (s *forgeState) nextSeq() int {
 }
 
 func (s *forgeState) requestID() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.requestSeq++
-	return fmt.Sprintf("req-%d", s.requestSeq)
+	return fmt.Sprintf("req-%d", s.requestSeq.Add(1))
 }
 
 func repoKey(owner, name string) string { return owner + "/" + name }

@@ -10,10 +10,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 )
 
 func main() {
 	log.SetOutput(os.Stderr)
+	// The pod gives the forge 2 CPUs; this VM's quota is 1.5 shared CPUs
+	// while the host exposes 4. Pin GOMAXPROCS to 2 so the Go scheduler
+	// does not run more threads than the cgroup can actually schedule.
+	runtime.GOMAXPROCS(2)
 	token := os.Getenv("MAKEFUN_SHOP_TOKEN")
 	if token == "" {
 		log.Fatal("MAKEFUN_SHOP_TOKEN must be set")
