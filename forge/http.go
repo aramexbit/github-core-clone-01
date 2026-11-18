@@ -56,7 +56,10 @@ func (fs *forgeServer) dispatch(req *rawRequest) (resp httpResponse) {
 					iss, ok := repo.issues[*fast.number]
 					var buf []byte
 					if ok {
-						buf = append([]byte(nil), iss.json...)
+						// iss.json is never mutated in place (PATCH
+						// replaces the slice); the raw writer copies
+						// it into the response buffer, so no copy here.
+						buf = iss.json
 					}
 					repo.mu.RUnlock()
 					if ok {

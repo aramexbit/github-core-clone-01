@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -397,8 +398,10 @@ func (r *repo) lsRefsLines() []string {
 }
 
 func (r *repo) lsRefsResponse(opts *lsRefsOptions) []byte {
-	// No cache: ls-refs runs once per clone and the response is cheap to
-	// build; a cache would need locking on the concurrent clone path.
+	key := lsRefsCacheKey(opts)
+	if cached, ok := r.lsCache.Load(key); ok {
+		return cached.([]byte)
+	}
 	all := r.lsRefsLines()
 	var out [][]byte
 	for _, line := range all {
@@ -432,7 +435,32 @@ func (r *repo) lsRefsResponse(opts *lsRefsOptions) []byte {
 		out = append(out, pktLineStr(text+"\n"))
 	}
 	out = append(out, pktFlush)
-	return bytes.Join(out, nil)
+	buf := bytes.Join(out, nil)
+	r.lsCache.Store(key, buf)
+	return buf
+}
+
+// lsRefsCacheKey encodes the ls-refs options; the response depends only
+// on these options plus repo state (refs), which invalidateCache clears.
+func lsRefsCacheKey(opts *lsRefsOptions) string {
+	var b strings.Builder
+	if opts.peel {
+		b.WriteByte('p')
+	}
+	if opts.symrefs {
+		b.WriteByte('s')
+	}
+	if opts.unborn {
+		b.WriteByte('u')
+	}
+	b.WriteByte(':')
+	for i, p := range opts.prefixes {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(p)
+	}
+	return b.String()
 }
 
 func removeSymrefAttr(text string) string {
@@ -540,23 +568,9 @@ func (r *repo) handleFetch(req *fetchRequest) []byte {
 	if req.lsRefs != nil {
 		return r.lsRefsResponse(req.lsRefs)
 	}
-	// Cache key: sorted wants/haves/shallow + depth + version.
-	keyObj := struct {
-		W []string `json:"w"`
-		H []string `json:"h"`
-		S []string `json:"s"`
-		D *int     `json:"d"`
-		V int      `json:"v"`
-	}{
-		W: sortedCopy(req.wants),
-		H: sortedCopy(req.haves),
-		S: sortedCopy(req.shallow),
-		D: req.depth,
-	}
-	if req.isV2 {
-		keyObj.V = 2
-	}
-	key := string(marshalJSON(keyObj))
+	// Cache key: sorted wants/haves/shallow + depth + version, built
+	// with a strings.Builder (no JSON encoding on the hot path).
+	key := fetchCacheKey(req)
 	if cached, ok := r.packCache.Load(key); ok {
 		return cached.([]byte)
 	}
@@ -580,6 +594,40 @@ func sortedCopy(in []string) []string {
 	copy(out, in)
 	sort.Strings(out)
 	return out
+}
+
+// fetchCacheKey builds the pack-cache key without JSON encoding.
+// Oids are 40 hex chars, so "," and "|" separators are unambiguous.
+func fetchCacheKey(req *fetchRequest) string {
+	var b strings.Builder
+	if req.isV2 {
+		b.WriteByte('2')
+	} else {
+		b.WriteByte('0')
+	}
+	b.WriteByte('|')
+	if req.depth != nil {
+		b.WriteString(strconv.Itoa(*req.depth))
+	} else {
+		b.WriteByte('-')
+	}
+	b.WriteByte('|')
+	writeSortedOids(&b, req.wants)
+	b.WriteByte('|')
+	writeSortedOids(&b, req.haves)
+	b.WriteByte('|')
+	writeSortedOids(&b, req.shallow)
+	return b.String()
+}
+
+func writeSortedOids(b *strings.Builder, in []string) {
+	sorted := sortedCopy(in)
+	for i, s := range sorted {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(s)
+	}
 }
 
 // ------------------------------------------------------------ push

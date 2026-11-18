@@ -298,7 +298,7 @@ func handleIssues(s *forgeState, r *repo, sub []string, method string, query map
 	if len(sub) == 1 {
 		if method == "GET" {
 			r.mu.RLock()
-			bodyBytes := append([]byte(nil), iss.json...)
+			bodyBytes := iss.json
 			r.mu.RUnlock()
 			return jsonRespRaw(200, bodyBytes)
 		}

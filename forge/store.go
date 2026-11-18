@@ -74,6 +74,7 @@ type repo struct {
 
 	packCache   sync.Map // string -> []byte
 	advCache    sync.Map // service -> []byte
+	lsCache     sync.Map // ls-refs opts key -> []byte
 	commitCache sync.Map // oid -> commitParts
 	treeCache   sync.Map // oid -> []treeEntry
 	treeByName  sync.Map // tree oid -> map[string]treeEntry
@@ -198,6 +199,7 @@ func (r *repo) createCommit(tree string, parents []string, message string) strin
 func (r *repo) invalidateCache() {
 	r.packCache.Range(func(k, v any) bool { r.packCache.Delete(k); return true })
 	r.advCache.Range(func(k, v any) bool { r.advCache.Delete(k); return true })
+	r.lsCache.Range(func(k, v any) bool { r.lsCache.Delete(k); return true })
 }
 
 // treeEntriesOf returns parsed entries for a tree object, cached.
