@@ -256,20 +256,12 @@ func handleIssues(s *forgeState, r *repo, sub []string, method string, query map
 			return jsonResp(200, out, nil)
 		}
 		if method == "POST" {
-			parsed, ok := parseJSONBody(req.body)
+			title, bodyText, labels, ok := fastIssueFields(req.body)
 			if !ok {
 				return errJSON(400, "invalid JSON body")
 			}
-			body := bodyMap(parsed)
-			title, _ := body["title"].(string)
 			if title == "" {
 				return errJSON(422, "title is required")
-			}
-			var labels []string
-			if arr, isArr := body["labels"].([]any); isArr {
-				for _, l := range arr {
-					labels = append(labels, toStringJS(l))
-				}
 			}
 			r.mu.RLock()
 			for _, l := range labels {
@@ -279,7 +271,6 @@ func handleIssues(s *forgeState, r *repo, sub []string, method string, query map
 				}
 			}
 			r.mu.RUnlock()
-			bodyText, _ := body["body"].(string)
 			iss := s.createIssue(r, title, bodyText, labels)
 			return jsonRespRaw(201, iss.json)
 		}

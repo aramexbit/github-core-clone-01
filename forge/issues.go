@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -33,23 +34,41 @@ func (s *forgeState) createIssue(r *repo, title, body string, labels []string) *
 
 // issueJSONString renders the fixed issue shape byte-identically to
 // JSON.stringify(issueToJson(...)): same key order, same string escaping.
+// Manual appends (no fmt.Sprintf) for the write hot path.
 func issueJSONString(r *repo, iss *issue) string {
-	var labels strings.Builder
+	var b strings.Builder
+	b.Grow(256)
+	b.WriteString(`{"id":`)
+	b.WriteString(strconv.Itoa(iss.id))
+	b.WriteString(`,"number":`)
+	b.WriteString(strconv.Itoa(iss.number))
+	b.WriteString(`,"title":`)
+	b.WriteString(jsonString(iss.title))
+	b.WriteString(`,"body":`)
+	b.WriteString(jsonString(iss.body))
+	b.WriteString(`,"state":`)
+	b.WriteString(jsonString(iss.state))
+	b.WriteString(`,"labels":[`)
 	for i, l := range iss.labels {
 		if i > 0 {
-			labels.WriteString(",")
+			b.WriteByte(',')
 		}
-		labels.WriteString(`{"name":`)
-		labels.WriteString(jsonString(l))
-		labels.WriteString(`}`)
+		b.WriteString(`{"name":`)
+		b.WriteString(jsonString(l))
+		b.WriteByte('}')
 	}
-	return fmt.Sprintf(`{"id":%d,"number":%d,"title":%s,"body":%s,"state":%s,"labels":[%s],"user":{"login":%s,"id":%d},"created_at":%s,"updated_at":%s,"html_url":%s}`,
-		iss.id, iss.number,
-		jsonString(iss.title), jsonString(iss.body), jsonString(iss.state),
-		labels.String(),
-		jsonString(viewerLogin), viewerID,
-		jsonString(iss.createdAt), jsonString(iss.updatedAt),
-		jsonString(fmt.Sprintf("https://example.invalid/%s/%s/issues/%d", r.owner, r.name, iss.number)))
+	b.WriteString(`],"user":{"login":`)
+	b.WriteString(jsonString(viewerLogin))
+	b.WriteString(`,"id":`)
+	b.WriteString(strconv.Itoa(viewerID))
+	b.WriteString(`},"created_at":`)
+	b.WriteString(jsonString(iss.createdAt))
+	b.WriteString(`,"updated_at":`)
+	b.WriteString(jsonString(iss.updatedAt))
+	b.WriteString(`,"html_url":`)
+	b.WriteString(jsonString("https://example.invalid/" + r.owner + "/" + r.name + "/issues/" + strconv.Itoa(iss.number)))
+	b.WriteByte('}')
+	return b.String()
 }
 
 // issueToJSON builds the issue object for non-hot paths (lists, MCP).

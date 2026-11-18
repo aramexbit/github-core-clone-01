@@ -66,31 +66,20 @@ func (fs *forgeServer) dispatch(req *rawRequest) (resp httpResponse) {
 						return jsonRespRaw(200, buf)
 					}
 				} else if method == "POST" && fast.number == nil {
-					parsed, ok := parseJSONBody(body)
-					if ok {
-						pbody := bodyMap(parsed)
-						title, _ := pbody["title"].(string)
-						if title != "" {
-							var labels []string
-							if arr, isArr := pbody["labels"].([]any); isArr {
-								for _, l := range arr {
-									labels = append(labels, toStringJS(l))
-								}
+					title, bodyText, labels, ok := fastIssueFields(body)
+					if ok && title != "" {
+						repo.mu.RLock()
+						labelsOK := true
+						for _, l := range labels {
+							if _, has := repo.labels[l]; !has {
+								labelsOK = false
+								break
 							}
-							repo.mu.RLock()
-							labelsOK := true
-							for _, l := range labels {
-								if _, has := repo.labels[l]; !has {
-									labelsOK = false
-									break
-								}
-							}
-							repo.mu.RUnlock()
-							if labelsOK {
-								bodyText, _ := pbody["body"].(string)
-								iss := fs.state.createIssue(repo, title, bodyText, labels)
-								return jsonRespRaw(201, iss.json)
-							}
+						}
+						repo.mu.RUnlock()
+						if labelsOK {
+							iss := fs.state.createIssue(repo, title, bodyText, labels)
+							return jsonRespRaw(201, iss.json)
 						}
 					}
 				}
