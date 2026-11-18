@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"runtime"
 )
@@ -33,8 +32,7 @@ func main() {
 	port := ln.Addr().(*net.TCPAddr).Port
 	fmt.Printf("PORT %d\n", port)
 	_ = os.Stdout.Sync()
-	httpServer := &http.Server{Handler: server}
-	if err := httpServer.Serve(ln); err != nil {
+	if err := serveRaw(ln, server); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 }

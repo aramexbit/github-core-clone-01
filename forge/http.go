@@ -5,8 +5,6 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -19,78 +17,33 @@ type forgeServer struct {
 	state *forgeState
 }
 
-func (fs *forgeServer) writeResp(w http.ResponseWriter, resp httpResponse) {
-	h := w.Header()
-	h.Set("x-github-request-id", fs.state.requestID())
-	for k, v := range resp.headers {
-		h.Set(k, v)
-	}
-	if resp.body == nil {
-		// No body (204/202/DELETE): write headers only.
-		w.WriteHeader(resp.status)
-		return
-	}
-	h.Set("content-length", strconv.Itoa(len(resp.body)))
-	w.WriteHeader(resp.status)
-	w.Write(resp.body)
-}
-
-func (fs *forgeServer) writeErr(w http.ResponseWriter, status int, message string) {
-	fs.writeResp(w, errJSON(status, message))
-}
-
-func (fs *forgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// dispatch routes one parsed raw request and returns the response.
+// The raw server (rawhttp.go) serializes the response in one write.
+func (fs *forgeServer) dispatch(req *rawRequest) (resp httpResponse) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			// Never let a handler panic kill the connection without a
 			// response: answer 500 like the Node try/catch does.
-			func() {
-				defer func() { _ = recover() }()
-				fs.writeErr(w, 500, fmt.Sprintf("%v", rec))
-			}()
+			resp = errJSON(500, fmt.Sprintf("%v", rec))
 		}
 	}()
 
-	// Raw request-target, like Node's req.url: split path and query.
-	rawURI := r.URL.RequestURI()
-	qIndex := strings.IndexByte(rawURI, '?')
-	path := rawURI
-	query := ""
-	if qIndex >= 0 {
-		path = rawURI[:qIndex]
-		query = rawURI[qIndex+1:]
-	}
-	method := r.Method
+	path := req.path
+	query := req.query
+	method := req.method
 
 	// Health probe: no auth, always 200.
 	if path == "/healthz" && method == "GET" {
-		fs.writeResp(w, jsonResp(200, map[string]any{"ok": true}, nil))
-		return
+		return jsonResp(200, map[string]any{"ok": true}, nil)
 	}
 
 	// Auth for everything else.
-	if r.Header.Get("Authorization") != fs.state.authHeader {
-		fs.writeErr(w, 401, "unauthorized")
-		return
+	if auth, _ := req.header("authorization"); auth != fs.state.authHeader {
+		return errJSON(401, "unauthorized")
 	}
 
-	// Body for non-GET/HEAD.
-	var body []byte
-	if method != "GET" && method != "HEAD" {
-		limited := io.LimitReader(r.Body, maxBodyBytes+1)
-		b, err := io.ReadAll(limited)
-		if err != nil {
-			fs.writeErr(w, 400, "could not read request body")
-			return
-		}
-		if len(b) > maxBodyBytes {
-			fs.writeErr(w, 400, "request body too large")
-			return
-		}
-		body = b
-	} else {
-		body = []byte{}
-	}
+	// The raw server already read the body (Content-Length or chunked).
+	body := req.body
 
 	// Fast path: GET / POST a single issue (the bench's hot shapes).
 	// Exact segment match, no query string, no percent-escapes.
@@ -107,8 +60,7 @@ func (fs *forgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					}
 					repo.mu.RUnlock()
 					if ok {
-						fs.writeResp(w, jsonRespRaw(200, buf))
-						return
+						return jsonRespRaw(200, buf)
 					}
 				} else if method == "POST" && fast.number == nil {
 					parsed, ok := parseJSONBody(body)
@@ -134,8 +86,7 @@ func (fs *forgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							if labelsOK {
 								bodyText, _ := pbody["body"].(string)
 								iss := fs.state.createIssue(repo, title, bodyText, labels)
-								fs.writeResp(w, jsonRespRaw(201, iss.json))
-								return
+								return jsonRespRaw(201, iss.json)
 							}
 						}
 					}
@@ -151,48 +102,34 @@ func (fs *forgeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tail := m[3]
 		repo := fs.state.getRepo(owner, repoName)
 		if repo == nil {
-			fs.writeErr(w, 404, "not found")
-			return
+			return errJSON(404, "not found")
 		}
-		fs.serveGit(w, r, repo, tail, query, method, body)
-		return
+		return fs.serveGit(req, repo, tail, query)
 	}
 
 	// Generic router: lowercased headers copy + httpRequest.
-	headers := map[string]string{}
-	for k, vs := range r.Header {
-		lk := strings.ToLower(k)
-		if len(vs) == 1 {
-			headers[lk] = vs[0]
-		} else {
-			headers[lk] = strings.Join(vs, ", ")
-		}
-	}
-	httpReq := &httpRequest{method: method, path: path, query: query, headers: headers, body: body, host: r.Host}
+	headers := req.headerMap()
+	httpReq := &httpRequest{method: method, path: path, query: query, headers: headers, body: body, host: req.host}
 
 	// REST
 	if path == "/api/v3" || strings.HasPrefix(path, "/api/v3/") {
-		fs.writeResp(w, handleRest(fs.state, httpReq))
-		return
+		return handleRest(fs.state, httpReq)
 	}
 
 	// GraphQL
 	if path == "/api/graphql" {
 		if method != "POST" {
-			fs.writeErr(w, 405, "method not allowed")
-			return
+			return errJSON(405, "method not allowed")
 		}
-		fs.writeResp(w, handleGraphQL(fs.state, body))
-		return
+		return handleGraphQL(fs.state, body)
 	}
 
 	// MCP
 	if path == "/mcp" {
-		fs.writeResp(w, handleMCP(fs.state, httpReq))
-		return
+		return handleMCP(fs.state, httpReq)
 	}
 
-	fs.writeErr(w, 404, "not found")
+	return errJSON(404, "not found")
 }
 
 var gitPathRe = regexp.MustCompile(`^/([^/]+)/([^/]+)\.git/(.*)$`)
@@ -275,62 +212,57 @@ func queryService(query string) string {
 	return ""
 }
 
-func wantsV2(r *http.Request) bool {
-	gp := r.Header.Get("Git-Protocol")
+func wantsV2(req *rawRequest) bool {
+	gp, _ := req.header("git-protocol")
 	return gp == "version=2" || strings.Contains(gp, "version=2")
 }
 
-func (fs *forgeServer) serveGit(w http.ResponseWriter, r *http.Request, repo *repo, tail, query, method string, body []byte) {
+func (fs *forgeServer) serveGit(req *rawRequest, repo *repo, tail, query string) httpResponse {
+	method := req.method
+	body := req.body
 	if tail == "info/refs" && method == "GET" {
 		service := queryService(query)
 		if service == "git-upload-pack" {
 			repo.mu.RLock()
 			var adv []byte
-			if wantsV2(r) {
+			if wantsV2(req) {
 				adv = v2Advertisement
 			} else {
 				adv = repo.advertisementV0("git-upload-pack")
 			}
 			repo.mu.RUnlock()
-			fs.writeResp(w, httpResponse{status: 200, headers: map[string]string{"content-type": "application/x-git-upload-pack-advertisement"}, body: adv})
-			return
+			return httpResponse{status: 200, headers: map[string]string{"content-type": "application/x-git-upload-pack-advertisement"}, body: adv}
 		}
 		if service == "git-receive-pack" {
 			repo.mu.RLock()
 			adv := repo.advertisementV0("git-receive-pack")
 			repo.mu.RUnlock()
-			fs.writeResp(w, httpResponse{status: 200, headers: map[string]string{"content-type": "application/x-git-receive-pack-advertisement"}, body: adv})
-			return
+			return httpResponse{status: 200, headers: map[string]string{"content-type": "application/x-git-receive-pack-advertisement"}, body: adv}
 		}
-		fs.writeErr(w, 404, "not found")
-		return
+		return errJSON(404, "not found")
 	}
 	if tail == "git-upload-pack" && method == "POST" {
 		packets, _, err := parsePktLines(body)
 		if err != nil {
-			fs.writeErr(w, 400, err.Error())
-			return
+			return errJSON(400, err.Error())
 		}
 		lines := pktLinesToText(packets)
-		fetchReq := parseFetchRequest(lines, wantsV2(r))
+		fetchReq := parseFetchRequest(lines, wantsV2(req))
 		repo.mu.RLock()
 		resp := repo.handleFetch(fetchReq)
 		repo.mu.RUnlock()
-		fs.writeResp(w, httpResponse{status: 200, headers: map[string]string{"content-type": "application/x-git-upload-pack-result"}, body: resp})
-		return
+		return httpResponse{status: 200, headers: map[string]string{"content-type": "application/x-git-upload-pack-result"}, body: resp}
 	}
 	if tail == "git-receive-pack" && method == "POST" {
 		commands, pack, err := parsePushRequest(body)
 		if err != nil {
-			fs.writeErr(w, 400, err.Error())
-			return
+			return errJSON(400, err.Error())
 		}
 		repo.mu.Lock()
 		results := repo.applyPush(commands, pack)
 		report := pushReportBuffer(results)
 		repo.mu.Unlock()
-		fs.writeResp(w, httpResponse{status: 200, headers: map[string]string{"content-type": "application/x-git-receive-pack-result"}, body: report})
-		return
+		return httpResponse{status: 200, headers: map[string]string{"content-type": "application/x-git-receive-pack-result"}, body: report}
 	}
-	fs.writeErr(w, 404, "not found")
+	return errJSON(404, "not found")
 }

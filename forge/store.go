@@ -108,10 +108,6 @@ func (s *forgeState) nextSeq() int {
 	return s.globalSeq
 }
 
-func (s *forgeState) requestID() string {
-	return fmt.Sprintf("req-%d", s.requestSeq.Add(1))
-}
-
 func repoKey(owner, name string) string { return owner + "/" + name }
 
 func (s *forgeState) getRepo(owner, name string) *repo {
