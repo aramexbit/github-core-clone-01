@@ -326,20 +326,23 @@ func (r *repo) advertisementV0(service string) []byte {
 	if cached, ok := r.advCache.Load(service); ok {
 		return cached.([]byte)
 	}
-	var parts [][]byte
-	parts = append(parts, pktLineStr(fmt.Sprintf("# service=%s\n", service)), pktFlush)
-	var caps string
-	if service == "git-upload-pack" {
-		caps = fmt.Sprintf("symref=HEAD:refs/heads/%s side-band-64k ofs-delta agent=%s shallow thin-pack", r.defaultBranch, agentName)
-	} else {
-		caps = fmt.Sprintf("report-status side-band-64k delete-refs ofs-delta agent=%s", agentName)
-	}
+	// Single buffer, no fmt.Sprintf / per-line allocations: every push
+	// invalidates the cache, so this rebuild runs on every push's
+	// info/refs. Byte-identical to the previous Sprintf version
+	// (verified by TestAdvGolden).
+	buf := make([]byte, 0, 512)
+	buf = appendPktLine(buf, "# service=", service, "\n")
+	buf = append(buf, pktFlush...)
 	tip, _ := resolveRef(r, "HEAD")
 	headOID := tip
 	if headOID == "" {
 		headOID = zeroOID
 	}
-	parts = append(parts, pktLineStr(fmt.Sprintf("%s HEAD\x00%s\n", headOID, caps)))
+	if service == "git-upload-pack" {
+		buf = appendPktLine(buf, headOID, " HEAD\x00symref=HEAD:refs/heads/", r.defaultBranch, " side-band-64k ofs-delta agent=", agentName, " shallow thin-pack\n")
+	} else {
+		buf = appendPktLine(buf, headOID, " HEAD\x00report-status side-band-64k delete-refs ofs-delta agent=", agentName, "\n")
+	}
 	names := make([]string, 0, len(r.refs))
 	for name := range r.refs {
 		names = append(names, name)
@@ -347,16 +350,15 @@ func (r *repo) advertisementV0(service string) []byte {
 	sort.Strings(names)
 	for _, name := range names {
 		oid := r.refs[name]
-		parts = append(parts, pktLineStr(fmt.Sprintf("%s %s\n", oid, name)))
+		buf = appendPktLine(buf, oid, " ", name, "\n")
 		obj := r.objects[oid]
 		if obj != nil && obj.typ == "tag" && service == "git-upload-pack" {
 			if peeled, ok := peelToCommit(r, oid); ok {
-				parts = append(parts, pktLineStr(fmt.Sprintf("%s %s^{}\n", peeled, name)))
+				buf = appendPktLine(buf, peeled, " ", name, "^{}\n")
 			}
 		}
 	}
-	parts = append(parts, pktFlush)
-	buf := bytes.Join(parts, nil)
+	buf = append(buf, pktFlush...)
 	r.advCache.Store(service, buf)
 	return buf
 }

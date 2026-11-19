@@ -103,6 +103,34 @@ func pktLine(payload []byte) []byte {
 
 func pktLineStr(s string) []byte { return pktLine([]byte(s)) }
 
+// appendHex4 appends n as exactly 4 lowercase hex digits (a pkt-line
+// length prefix). Callers must keep n < 65536, which holds for every
+// pkt-line this forge builds (advertisement and fetch lines are short).
+func appendHex4(buf []byte, n int) []byte {
+	const digits = "0123456789abcdef"
+	var tmp [4]byte
+	tmp[0] = digits[(n>>12)&0xf]
+	tmp[1] = digits[(n>>8)&0xf]
+	tmp[2] = digits[(n>>4)&0xf]
+	tmp[3] = digits[n&0xf]
+	return append(buf, tmp[:]...)
+}
+
+// appendPktLine appends one pkt-line built from parts with no intermediate
+// strings or per-line allocations: 4-hex length + the parts concatenated.
+// Byte-identical to pktLineStr(strings.Join(parts, "")).
+func appendPktLine(buf []byte, parts ...string) []byte {
+	total := 4
+	for _, p := range parts {
+		total += len(p)
+	}
+	buf = appendHex4(buf, total)
+	for _, p := range parts {
+		buf = append(buf, p...)
+	}
+	return buf
+}
+
 var pktFlush = []byte("0000")
 var pktDelim = []byte("0001")
 
