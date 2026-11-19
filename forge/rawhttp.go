@@ -299,12 +299,14 @@ func parseHead(head []byte) (req *rawRequest, contentLength int, chunked bool, e
 	sp2 += sp1 + 1
 	method := string(line[:sp1])
 	target := string(line[sp1+1 : sp2])
-	version := string(line[sp2+1:])
+	// Version compared as bytes: the string conversion was 1 alloc/req
+	// for a value that is only ever tested against two literals.
+	ver := line[sp2+1:]
 	var version11 bool
-	switch version {
-	case "HTTP/1.1":
+	switch {
+	case bytes.Equal(ver, []byte("HTTP/1.1")):
 		version11 = true
-	case "HTTP/1.0":
+	case bytes.Equal(ver, []byte("HTTP/1.0")):
 		version11 = false
 	default:
 		return nil, -1, false, false, false
@@ -336,7 +338,7 @@ func parseHead(head []byte) (req *rawRequest, contentLength int, chunked bool, e
 		query = target[qi+1:]
 	}
 
-	req = &rawRequest{method: method, path: path, query: query, host: host, version11: version11}
+	req = &rawRequest{method: method, path: path, query: query, host: host, version11: version11, headers: make([]rawHeader, 0, 8)}
 	rest := head[lineEnd+2:]
 	for len(rest) > 0 {
 		eol := bytes.Index(rest, []byte("\r\n"))
