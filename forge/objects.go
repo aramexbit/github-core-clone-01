@@ -310,6 +310,20 @@ func readOfsDeltaBase(buf []byte, start int) (baseOffset int, next int, err erro
 // strictness.
 var flateReaderPool = sync.Pool{New: func() any { return flate.NewReader(bytes.NewReader(nil)) }}
 
+// Pooled inflate buffers: bufio.NewReaderSize + bytes.NewReader cost 3
+// allocations per object (bufio.Reader, its 512-byte buffer, bytes.Reader).
+// Reused alongside the pooled flate reader; Reset swaps in the new slice.
+type inflateBufs struct {
+	rdr *bytes.Reader
+	br  *bufio.Reader
+}
+
+var inflateBufPool = sync.Pool{New: func() any {
+	b := &inflateBufs{rdr: bytes.NewReader(nil)}
+	b.br = bufio.NewReaderSize(b.rdr, 512)
+	return b
+}}
+
 func inflateAt(buf []byte, offset, end int) ([]byte, int, error) {
 	if end-offset < 6 {
 		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: stream too short", offset)
@@ -319,17 +333,20 @@ func inflateAt(buf []byte, offset, end int) ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: bad header", offset)
 	}
 	inner := buf[offset+2 : end]
-	rdr := bytes.NewReader(inner)
-	br := bufio.NewReaderSize(rdr, 512)
+	ib := inflateBufPool.Get().(*inflateBufs)
+	ib.rdr.Reset(inner)
+	ib.br.Reset(ib.rdr)
 	fr := flateReaderPool.Get().(io.ReadCloser)
-	fr.(flate.Resetter).Reset(br, nil)
+	fr.(flate.Resetter).Reset(ib.br, nil)
 	data, err := io.ReadAll(fr)
 	fr.Close()
 	flateReaderPool.Put(fr)
 	if err != nil {
+		inflateBufPool.Put(ib)
 		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: %v", offset, err)
 	}
-	consumed := (len(inner) - rdr.Len()) - br.Buffered()
+	consumed := (len(inner) - ib.rdr.Len()) - ib.br.Buffered()
+	inflateBufPool.Put(ib)
 	if consumed < 0 || offset+2+consumed+4 > end {
 		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: truncated checksum", offset)
 	}
@@ -450,6 +467,7 @@ type rawEntry struct {
 	baseOID    string
 	hasBase    bool
 	resolved   *resolvedObj
+	resolving  bool // delta-cycle guard (was a map[int]bool per readPack)
 }
 
 type resolvedObj struct {
@@ -473,14 +491,20 @@ func readPack(pack []byte, resolveBase func(oid string) *gitObject) (*readPackRe
 	}
 	declaredCount := binary.BigEndian.Uint32(pack[8:12])
 	trailerStart := len(pack) - 20
-	trailer := fmt.Sprintf("%x", pack[trailerStart:])
-	computed := sha1Hex(pack[:trailerStart])
-	checksumOK := trailer == computed
+	// Raw SHA-1 compare: the old hex-string round-trip (Sprintf + sha1Hex)
+	// cost 2 allocations per pack for no reason.
+	sum := sha1.Sum(pack[:trailerStart])
+	checksumOK := bytes.Equal(pack[trailerStart:], sum[:])
 	if !checksumOK {
 		return nil, fmt.Errorf("pack trailer checksum mismatch")
 	}
 	raw := make([]*rawEntry, 0, declaredCount)
-	byOffset := make(map[int]*rawEntry)
+	// byOffset is only needed for ofs-delta bases; small packs (the
+	// benchmark's 3 objects) scan the slice instead of building a map.
+	var byOffset map[int]*rawEntry
+	if declaredCount > 16 {
+		byOffset = make(map[int]*rawEntry, declaredCount)
+	}
 	offset := 12
 	for i := uint32(0); i < declaredCount; i++ {
 		entryOffset := offset
@@ -506,7 +530,9 @@ func readPack(pack []byte, resolveBase func(oid string) *gitObject) (*readPackRe
 			if offset+20 > trailerStart {
 				return nil, fmt.Errorf("ref-delta base id truncated")
 			}
-			entry.baseOID = fmt.Sprintf("%x", pack[offset:offset+20])
+			// hex.EncodeToString is one allocation; Sprintf("%x") was the
+			// same count at far higher CPU cost.
+			entry.baseOID = hex.EncodeToString(pack[offset : offset+20])
 			offset += 20
 			entry.hasBase = true
 		} else if codeType[tc] == "" {
@@ -522,28 +548,49 @@ func readPack(pack []byte, resolveBase func(oid string) *gitObject) (*readPackRe
 		entry.data = data
 		offset = nextOff
 		raw = append(raw, entry)
-		byOffset[entryOffset] = entry
+		if byOffset != nil {
+			byOffset[entryOffset] = entry
+		}
 	}
 	if offset != trailerStart {
 		return nil, fmt.Errorf("pack has %d stray bytes before trailer", trailerStart-offset)
 	}
 	objects := make(map[string]*gitObject)
-	resolvedByOID := make(map[string]*rawEntry)
-	resolving := make(map[int]bool)
+	// resolvedByOID is only consulted for ref-deltas; packs without any
+	// (the benchmark's) skip the map entirely. Reading a nil map is
+	// safe in Go, so only the write below needs the guard.
+	var resolvedByOID map[string]*rawEntry
+	for _, e := range raw {
+		if e.typeCode == 7 {
+			resolvedByOID = make(map[string]*rawEntry, len(raw))
+			break
+		}
+	}
+	lookupByOffset := func(off int) *rawEntry {
+		if byOffset != nil {
+			return byOffset[off]
+		}
+		for _, cand := range raw {
+			if cand.offset == off {
+				return cand
+			}
+		}
+		return nil
+	}
 	deltaCount := 0
 	var resolve func(e *rawEntry) (*resolvedObj, error)
 	resolve = func(e *rawEntry) (*resolvedObj, error) {
 		if e.resolved != nil {
 			return e.resolved, nil
 		}
-		if resolving[e.offset] {
+		if e.resolving {
 			return nil, fmt.Errorf("delta cycle at pack offset %d", e.offset)
 		}
-		resolving[e.offset] = true
+		e.resolving = true
 		var typ string
 		var data []byte
 		if e.typeCode == 6 {
-			baseEntry := byOffset[e.baseOffset]
+			baseEntry := lookupByOffset(e.baseOffset)
 			if baseEntry == nil {
 				return nil, fmt.Errorf("ofs-delta base at offset %d not in pack", e.baseOffset)
 			}
@@ -589,8 +636,10 @@ func readPack(pack []byte, resolveBase func(oid string) *gitObject) (*readPackRe
 		oid := hashObject(typ, data)
 		out := &resolvedObj{typ: typ, data: data, oid: oid}
 		e.resolved = out
-		resolvedByOID[oid] = e
-		delete(resolving, e.offset)
+		if resolvedByOID != nil {
+			resolvedByOID[oid] = e
+		}
+		e.resolving = false
 		return out, nil
 	}
 	for _, entry := range raw {
